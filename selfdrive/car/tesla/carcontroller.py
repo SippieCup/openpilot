@@ -373,7 +373,7 @@ class CarController(object):
       CS.v_cruise_pcm = max(0.,CS.v_ego * CV.MS_TO_KPH  +0.5) #BB try v_ego to reduce the false FCW warnings; was: vCS.v_cruise_actual
     # Get the turn signal from ALCA.
     turn_signal_needed, self.alca_enabled = self.ALCA.update(enabled, CS, actuators)
-    apply_angle = -actuators.steerAngle  # Tesla is reversed vs OP.
+    apply_angle = -(actuators.steerAngle * 1.2)  # Tesla is reversed vs OP.
     human_control = self.HSO.update_stat(self,CS, enabled, actuators, frame)
     human_lane_changing = changing_lanes and not self.alca_enabled
     enable_steer_control = (enabled
