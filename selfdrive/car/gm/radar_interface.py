@@ -1,12 +1,11 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+from __future__ import print_function
 import math
-import time
-import numpy as np
 from cereal import car
-from selfdrive.can.parser import CANParser
-from selfdrive.car.gm.interface import CanBus
-from selfdrive.car.gm.values import DBC, CAR
-from common.realtime import sec_since_boot
+from opendbc.can.parser import CANParser
+from selfdrive.car.gm.values import DBC, CAR, CanBus
+from selfdrive.config import Conversions as CV
+from selfdrive.car.interfaces import RadarInterfaceBase
 
 RADAR_HEADER_MSG = 1120
 SLOT_1_MSG = RADAR_HEADER_MSG + 1
@@ -16,57 +15,48 @@ NUM_SLOTS = 20
 # messages that are present in DBC
 LAST_RADAR_MSG = RADAR_HEADER_MSG + NUM_SLOTS
 
-def create_radar_can_parser(canbus, car_fingerprint):
-
-  dbc_f = DBC[car_fingerprint]['radar']
-  if car_fingerprint in (CAR.VOLT, CAR.MALIBU, CAR.HOLDEN_ASTRA, CAR.ACADIA, CAR.CADILLAC_ATS):
-    # C1A-ARS3-A by Continental
-    radar_targets = range(SLOT_1_MSG, SLOT_1_MSG + NUM_SLOTS)
-    signals = list(zip(['FLRRNumValidTargets',
-                   'FLRRSnsrBlckd', 'FLRRYawRtPlsblityFlt',
-                   'FLRRHWFltPrsntInt', 'FLRRAntTngFltPrsnt',
-                   'FLRRAlgnFltPrsnt', 'FLRRSnstvFltPrsntInt'] +
-                  ['TrkRange'] * NUM_SLOTS + ['TrkRangeRate'] * NUM_SLOTS +
-                  ['TrkRangeAccel'] * NUM_SLOTS + ['TrkAzimuth'] * NUM_SLOTS +
-                  ['TrkWidth'] * NUM_SLOTS + ['TrkObjectID'] * NUM_SLOTS,
-                  [RADAR_HEADER_MSG] * 7 + radar_targets * 6,
-                  [0] * 7 +
-                  [0.0] * NUM_SLOTS + [0.0] * NUM_SLOTS +
-                  [0.0] * NUM_SLOTS + [0.0] * NUM_SLOTS +
-                  [0.0] * NUM_SLOTS + [0] * NUM_SLOTS))
-
-    checks = []
-
-    return CANParser(dbc_f, signals, checks, canbus.obstacle)
-  else:
+def create_radar_can_parser(car_fingerprint):
+  if car_fingerprint not in (CAR.VOLT, CAR.MALIBU, CAR.HOLDEN_ASTRA, CAR.ACADIA, CAR.CADILLAC_ATS):
     return None
 
-class RadarInterface(object):
+  # C1A-ARS3-A by Continental
+  radar_targets = list(range(SLOT_1_MSG, SLOT_1_MSG + NUM_SLOTS))
+  signals = list(zip(['FLRRNumValidTargets',
+                 'FLRRSnsrBlckd', 'FLRRYawRtPlsblityFlt',
+                 'FLRRHWFltPrsntInt', 'FLRRAntTngFltPrsnt',
+                 'FLRRAlgnFltPrsnt', 'FLRRSnstvFltPrsntInt'] +
+                ['TrkRange'] * NUM_SLOTS + ['TrkRangeRate'] * NUM_SLOTS +
+                ['TrkRangeAccel'] * NUM_SLOTS + ['TrkAzimuth'] * NUM_SLOTS +
+                ['TrkWidth'] * NUM_SLOTS + ['TrkObjectID'] * NUM_SLOTS,
+                [RADAR_HEADER_MSG] * 7 + radar_targets * 6,
+                [0] * 7 +
+                [0.0] * NUM_SLOTS + [0.0] * NUM_SLOTS +
+                [0.0] * NUM_SLOTS + [0.0] * NUM_SLOTS +
+                [0.0] * NUM_SLOTS + [0] * NUM_SLOTS))
+
+  checks = []
+
+  return CANParser(DBC[car_fingerprint]['radar'], signals, checks, CanBus.OBSTACLE)
+
+class RadarInterface(RadarInterfaceBase):
   def __init__(self, CP):
-    # radar
-    self.pts = {}
+    super().__init__(CP)
 
-    self.delay = 0.0  # Delay of radar
-
-    canbus = CanBus()
-    print "Using %d as obstacle CAN bus ID" % canbus.obstacle
-    self.rcp = create_radar_can_parser(canbus, CP.carFingerprint)
+    self.rcp = create_radar_can_parser(CP.carFingerprint)
 
     self.trigger_msg = LAST_RADAR_MSG
     self.updated_messages = set()
+    self.radar_ts = CP.radarTimeStep
 
   def update(self, can_strings):
     if self.rcp is None:
-      time.sleep(0.05)   # nothing to do
-      return car.RadarData.new_message()
+      return super().update(None)
 
-    tm = int(sec_since_boot() * 1e9)
-    vls = self.rcp.update_strings(tm, can_strings)
+    vls = self.rcp.update_strings(can_strings)
     self.updated_messages.update(vls)
 
     if self.trigger_msg not in self.updated_messages:
       return None
-
 
     ret = car.RadarData.new_message()
     header = self.rcp.vl[RADAR_HEADER_MSG]
@@ -101,18 +91,17 @@ class RadarInterface(object):
           self.pts[targetId] = car.RadarData.RadarPoint.new_message()
           self.pts[targetId].trackId = targetId
         distance = cpt['TrkRange']
-        self.pts[targetId].dRel = distance # from front of car
+        self.pts[targetId].dRel = distance  # from front of car
         # From driver's pov, left is positive
-        deg_to_rad = np.pi/180.
-        self.pts[targetId].yRel = math.sin(deg_to_rad * cpt['TrkAzimuth']) * distance
+        self.pts[targetId].yRel = math.sin(cpt['TrkAzimuth'] * CV.DEG_TO_RAD) * distance
         self.pts[targetId].vRel = cpt['TrkRangeRate']
         self.pts[targetId].aRel = float('nan')
         self.pts[targetId].yvRel = float('nan')
 
-    for oldTarget in self.pts.keys():
-      if not oldTarget in currentTargets:
+    for oldTarget in list(self.pts.keys()):
+      if oldTarget not in currentTargets:
         del self.pts[oldTarget]
 
-    ret.points = self.pts.values()
+    ret.points = list(self.pts.values())
     self.updated_messages.clear()
     return ret

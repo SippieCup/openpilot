@@ -1,7 +1,6 @@
-from common.realtime import DT_MDL
+from common.numpy_fast import mean
 from common.kalman.simple_kalman import KF1D
-from selfdrive.car.tesla.readconfig import CarSettings
-from selfdrive.config import RADAR_TO_CENTER
+from selfdrive.config import RADAR_TO_CAMERA
 from common.numpy_fast import clip, interp
 
 # the longer lead decels, the more likely it will keep decelerating
@@ -14,44 +13,44 @@ SPEED, ACCEL = 0, 1   # Kalman filter states enum
 # stationary qualification parameters
 v_ego_stationary = 4.   # no stationary object flag below this speed
 
-# Lead Kalman Filter params
-_VLEAD_A = [[1.0, DT_MDL], [0.0, 1.0]]
-_VLEAD_C = [1.0, 0.0]
-#_VLEAD_Q = np.matrix([[10., 0.0], [0.0, 100.]])
-#_VLEAD_R = 1e3
-#_VLEAD_K = np.matrix([[ 0.05705578], [ 0.03073241]])
-_VLEAD_K = [[0.1988689], [0.28555364]]
 
-class Track(object):
-  def __init__(self):
-    self.ekf = None
+class Track():
+  def __init__(self, v_lead, kalman_params):
     self.cnt = 0
+    self.aLeadTau = _LEAD_ACCEL_TAU
+    self.K_A = kalman_params.A
+    self.K_C = kalman_params.C
+    self.K_K = kalman_params.K
+    self.kf = KF1D([[v_lead], [0.0]], self.K_A, self.K_C, self.K_K)
 
-  def update(self, d_rel, y_rel, v_rel,measured, a_rel, vy_rel, oClass, length, track_id,movingState, d_path, v_ego_t_aligned,use_tesla_radar):
+  def update(self, d_rel, y_rel, v_rel,measured, a_rel, vy_rel, oClass, length, track_id,movingState, d_path, v_ego_t_aligned,v_lead,use_tesla_radar):
     
     # relative values, copy
     self.dRel = d_rel   # LONG_DIST
     self.yRel = y_rel   # -LAT_DIST
     self.vRel = v_rel   # REL_SPEED
-    self.aRel = a_rel   # rel acceleration
-    self.vLat = vy_rel  # rel lateral speed
-    self.oClass = oClass # object class
-    self.length = length #length
+    self.vLead = v_lead
     self.measured = measured   # measured or estimate
     self.track_id = track_id
-    self.dPath = d_path
-    self.stationary = (movingState == 3)
+    self.oClass = oClass # object class
 
-    # computed velocity and accelerations
-    self.vLead = self.vRel + v_ego_t_aligned
+    if use_tesla_radar:
+      self.aRel = a_rel   # rel acceleration
+      self.vLat = vy_rel  # rel lateral speed
+      self.length = length #length
+      self.measured = measured   # measured or estimate
+      self.dPath = d_path
+      self.stationary = (movingState == 3)
+    else:
+      self.aRel = float('nan')   # rel acceleration
+      self.vLat = float('nan')  # rel lateral speed
+      self.length = 0.  #length
+      self.dPath = 0.
+      self.stationary = False
 
       
-    if self.cnt == 0:
-      self.kf = KF1D([[self.vLead], [0.0]], _VLEAD_A, _VLEAD_C, _VLEAD_K)
-    else:
+    if self.cnt > 0:
       self.kf.update(self.vLead)
-
-    self.cnt += 1
 
     self.vLeadK = float(self.kf.x[SPEED][0])
     self.aLeadK = float(self.kf.x[ACCEL][0])
@@ -62,6 +61,8 @@ class Track(object):
     else:
       self.aLeadTau *= 0.9
 
+    self.cnt += 1
+
   def get_key_for_cluster(self):
     # Weigh y higher since radar is inaccurate in this dimension
     return [self.dRel, self.yRel*2, self.vRel]
@@ -71,20 +72,17 @@ class Track(object):
     return [self.dRel, (self.yRel-dy)*2, self.vRel]
 
   def reset_a_lead(self, aLeadK, aLeadTau):
-    self.kf = KF1D([[self.vLead], [aLeadK]], _VLEAD_A, _VLEAD_C, _VLEAD_K)
+    self.kf = KF1D([[self.vLead], [aLeadK]], self.K_A, self.K_C, self.K_K)
     self.aLeadK = aLeadK
     self.aLeadTau = aLeadTau
 
-def mean(l):
-  return sum(l) / len(l)
 
-
-class Cluster(object):
-  def __init__(self):
+class Cluster():
+  def __init__(self,use_tesla_radar):
     self.tracks = set()
     #BB frame delay for dRel calculation, in seconds
     self.frame_delay = 0.2
-    self.useTeslaRadar = CarSettings().get_value("useTeslaRadar")
+    self.useTeslaRadar = use_tesla_radar
 
   def add(self, t):
     # add the first track
@@ -139,11 +137,11 @@ class Cluster(object):
 
   @property
   def measured(self):
-    return any([t.measured for t in self.tracks])
+    return any(t.measured for t in self.tracks)
 
   @property
   def oClass(self):
-    return all([t.oClass for t in self.tracks])
+    return min([t.oClass for t in self.tracks])
 
   @property
   def length(self):
@@ -151,7 +149,7 @@ class Cluster(object):
   
   @property
   def track_id(self):
-    return mean([t.track_id for t in self.tracks])
+    return max([t.track_id for t in self.tracks])
  
   @property
   def stationary(self):
@@ -181,7 +179,7 @@ class Cluster(object):
 
   def get_RadarState_from_vision(self, lead_msg, v_ego):
     return {
-      "dRel": float(lead_msg.dist - RADAR_TO_CENTER),
+      "dRel": float(lead_msg.dist - RADAR_TO_CAMERA),
       "yRel": float(lead_msg.relY),
       "vRel": float(lead_msg.relVel),
       "vLead": float(v_ego + lead_msg.relVel),
@@ -203,17 +201,8 @@ class Cluster(object):
     # lookahead time depends on cut-in distance. more attentive for close cut-ins
     # also, above 50 meters the predicted path isn't very reliable
 
-    # the distance at which v_lat matters is higher at higher speed
-    lookahead_dist = 40. + v_ego/1.2   #40m at 0mph, ~70m at 80mph
-
-    t_lookahead_v  = [1., 0.]
-    t_lookahead_bp = [10., lookahead_dist]
-
     # average dist
     d_path = self.dPath
-
-    # lat_corr used to be gated on enabled, now always running
-    t_lookahead = interp(self.dRel, t_lookahead_bp, t_lookahead_v)
 
     # correct d_path for lookahead time, considering only cut-ins and no more than 1m impact.
     lat_corr = 0. # BB disables for now : clip(t_lookahead * self.vLat, -1., 1.) if self.measured else 0.
@@ -221,7 +210,7 @@ class Cluster(object):
     # consider only cut-ins
     d_path = clip(d_path + lat_corr, min(0., d_path), max(0.,d_path))
 
-    return abs(d_path) < 1.5 and not self.stationary and not self.oncoming
+    return abs(d_path) < 1.5 and not self.stationary #and not self.oncoming
 
   def is_potential_lead_dy(self, v_ego,dy):
     # predict cut-ins by extrapolating lateral speed by a lookahead time

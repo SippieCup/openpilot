@@ -1,5 +1,4 @@
-#ifndef UTILPP_H
-#define UTILPP_H
+#pragma once
 
 #include <cstdio>
 #include <unistd.h>
@@ -18,7 +17,7 @@ inline bool starts_with(std::string s, std::string prefix) {
 template<typename ... Args>
 inline std::string string_format( const std::string& format, Args ... args ) {
     size_t size = snprintf( nullptr, 0, format.c_str(), args ... ) + 1;
-    std::unique_ptr<char[]> buf( new char[ size ] ); 
+    std::unique_ptr<char[]> buf( new char[ size ] );
     snprintf( buf.get(), size, format.c_str(), args ... );
     return std::string( buf.get(), buf.get() + size - 1 );
 }
@@ -32,7 +31,7 @@ inline std::string read_file(std::string fn) {
 
 inline std::string tohex(const uint8_t* buf, size_t buf_size) {
   std::unique_ptr<char[]> hexbuf(new char[buf_size*2+1]);
-  for (int i=0; i<buf_size; i++) {
+  for (size_t i=0; i < buf_size; i++) {
     sprintf(&hexbuf[i*2], "%02x", buf[i]);
   }
   hexbuf[buf_size*2] = 0;
@@ -63,4 +62,16 @@ inline std::string readlink(std::string path) {
 
 }
 
-#endif
+struct unique_fd {
+  unique_fd(int fd = -1) : fd_(fd) {}
+  unique_fd& operator=(unique_fd&& uf) {
+    fd_ = uf.fd_;
+    uf.fd_ = -1;
+    return *this;
+  }
+  ~unique_fd() {
+    if (fd_ != -1) close(fd_);
+  }
+  operator int() const { return fd_; }
+  int fd_;
+};

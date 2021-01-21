@@ -1,31 +1,29 @@
 #!/usr/bin/env python
 from cereal import car, tesla
 from common.numpy_fast import clip, interp
-from common.realtime import sec_since_boot, DT_CTRL
+from common.realtime import DT_CTRL
 from selfdrive.config import Conversions as CV
-from selfdrive.controls.lib.drive_helpers import create_event, EventTypes as ET, get_events
+from selfdrive.controls.lib.events import ET
 from selfdrive.controls.lib.vehicle_model import VehicleModel
-from selfdrive.car.tesla.carstate import CarState, get_can_parser, get_epas_parser, get_pedal_parser
 from selfdrive.car.tesla.values import CruiseButtons, CM, BP, AH, CAR,DBC
-from selfdrive.controls.lib.planner import _A_CRUISE_MAX_V_FOLLOWING
-from common.params import read_db
-from selfdrive.car import STD_CARGO_KG
+from common.params import Params
+from selfdrive.car import STD_CARGO_KG, scale_rot_inertia, scale_tire_stiffness, is_ecu_disconnected, gen_empty_fingerprint
 from selfdrive.car.tesla.readconfig import CarSettings
-import selfdrive.messaging as messaging
-from selfdrive.services import service_list
+from selfdrive.controls.lib.planner import _A_CRUISE_MAX_V
+from selfdrive.car.interfaces import CarInterfaceBase
 
+EventName = car.CarEvent.EventName
+
+A_ACC_MAX = max(_A_CRUISE_MAX_V)
 AudibleAlert = car.CarControl.HUDControl.AudibleAlert
 VisualAlert = car.CarControl.HUDControl.VisualAlert
 
 K_MULT = 0.8 
 K_MULTi = 280000.
 
-def tesla_compute_gb(accel, speed):
-  return float(accel) / 3.
-
-
-class CarInterface(object):
-  def __init__(self, CP, CarController):
+class CarInterface(CarInterfaceBase):
+  def __init__(self, CP, CarController, CarState):
+    super().__init__(CP, CarController, CarState)
     self.CP = CP
 
     self.frame = 0
@@ -34,8 +32,6 @@ class CarInterface(object):
     self.gas_pressed_prev = False
     self.brake_pressed_prev = False
     self.can_invalid_count = 0
-    self.alca = messaging.pub_sock(service_list['alcaStatus'].port)
-
     
 
     # *** init the major players ***
@@ -44,20 +40,25 @@ class CarInterface(object):
     mydbc = DBC[CP.carFingerprint]['pt']
     if CP.carFingerprint == CAR.MODELS and self.CS.fix1916:
       mydbc = mydbc + "1916"
-    self.cp = get_can_parser(CP,mydbc)
+    self.cp = self.CS.get_can_parser2(CP,mydbc)
     self.epas_cp = None
+    self.pedal_cp = None
     if self.CS.useWithoutHarness:
-      self.epas_cp = get_epas_parser(CP,0)
+      self.epas_cp = self.CS.get_epas_parser(CP,0)
+      self.pedal_cp = self.CS.get_pedal_parser(CP,0)
     else:
-      self.epas_cp = get_epas_parser(CP,2)
-    self.pedal_cp = get_pedal_parser(CP)
+      self.epas_cp = self.CS.get_epas_parser(CP,2)
+      self.pedal_cp = self.CS.get_pedal_parser(CP,2)
 
     self.CC = None
     if CarController is not None:
-      self.CC = CarController(self.cp.dbc_name)
+      self.CC = CarController(self.cp.dbc_name,CP,self.VM)
 
-    self.compute_gb = tesla_compute_gb
-    
+
+  @staticmethod
+  def compute_gb(accel, speed):
+    return float(accel) / 3.
+
 
 
   @staticmethod
@@ -65,6 +66,11 @@ class CarInterface(object):
     # limit the pcm accel cmd if:
     # - v_ego exceeds v_target, or
     # - a_ego exceeds a_target and v_ego is close to v_target
+
+    # normalized max accel. Allowing max accel at low speed causes speed overshoots
+    max_accel_bp = [10, 20]    # m/s
+    max_accel_v = [0.714, 1.0] # unit of max accel
+    max_accel = interp(v_ego, max_accel_bp, max_accel_v)
 
     eA = a_ego - a_target
     valuesA = [1.0, 0.1]
@@ -84,32 +90,34 @@ class CarInterface(object):
     # accelOverride is more or less the max throttle allowed to pcm: usually set to a constant
     # unless aTargetMax is very high and then we scale with it; this help in quicker restart
 
-    return float(max(0.714, a_target / max(_A_CRUISE_MAX_V_FOLLOWING))) * min(speedLimiter, accelLimiter)
+    return float(max(max_accel, a_target / A_ACC_MAX)) * min(speedLimiter, accelLimiter)
 
   @staticmethod
-  def get_params(candidate, fingerprint, vin="", is_panda_black=False):
+  def get_params(candidate, fingerprint=gen_empty_fingerprint(), car_fw=[]):
 
     # Scaled tire stiffness
     ts_factor = 8 
 
-    ret = car.CarParams.new_message()
+    ret = CarInterfaceBase.get_std_params(candidate, fingerprint)
 
     ret.carName = "tesla"
     ret.carFingerprint = candidate
-    ret.isPandaBlack = is_panda_black
 
-    teslaModel = read_db('/data/params','TeslaModel')
+    params = Params()
+    teslaModel = params.get("TeslaModel")
+    if teslaModel is not None:
+      teslaModel = teslaModel.decode()
     if teslaModel is None:
       teslaModel = "S"
 
     ret.safetyModel = car.CarParams.SafetyModel.tesla
     ret.safetyParam = 1
-    ret.carVin = vin
+    ret.carVin = "TESLAFAKEVIN12345"
 
     ret.enableCamera = True
     ret.enableGasInterceptor = False #keep this False for now
-    print "ECU Camera Simulated: ", ret.enableCamera
-    print "ECU Gas Interceptor: ", ret.enableGasInterceptor
+    print ("ECU Camera Simulated: ", ret.enableCamera)
+    print ("ECU Gas Interceptor: ", ret.enableGasInterceptor)
 
     ret.enableCruise = not ret.enableGasInterceptor
 
@@ -128,7 +136,7 @@ class CarInterface(object):
       ret.mass = mass_models
       ret.wheelbase = wheelbase_models
       ret.centerToFront = centerToFront_models
-      ret.steerRatio = 12.
+      ret.steerRatio = 11.5
       # Kp and Ki for the lateral control for 0, 20, 40, 60 mph
       ret.lateralTuning.pid.kpV, ret.lateralTuning.pid.kiV = [[1.20, 0.80, 0.60, 0.30], [0.16, 0.12, 0.08, 0.04]]
       ret.lateralTuning.pid.kf = 0.00006 # Initial test value TODO: investigate FF steer control for Model S?
@@ -140,31 +148,31 @@ class CarInterface(object):
           
       # Kp and Ki for the longitudinal control
       if teslaModel == "S":
-        ret.longitudinalTuning.kpBP = [0., 5., 35.]
-        ret.longitudinalTuning.kpV = [0.50, 0.45, 0.4]
-        ret.longitudinalTuning.kiBP = [0., 5., 35.]
-        ret.longitudinalTuning.kiV = [0.01,0.01,0.01]
+        ret.longitudinalTuning.kpBP = [0., 5., 22.,  35.]
+        ret.longitudinalTuning.kpV = [0.50, 0.45, 0.4, 0.4]
+        ret.longitudinalTuning.kiBP = [0., 5., 22., 35.]
+        ret.longitudinalTuning.kiV = [0.01,0.01,0.01,0.01]
       elif teslaModel == "SP":
-        ret.longitudinalTuning.kpBP = [0., 5., 35.]
-        ret.longitudinalTuning.kpV = [0.375, 0.325, 0.3]
-        ret.longitudinalTuning.kiBP = [0., 5., 35.]
-        ret.longitudinalTuning.kiV = [0.009,0.008,0.007]
+        ret.longitudinalTuning.kpBP = [0., 5., 22., 35.] # 0km/h, 18 km/h, 80, 128km/h
+        ret.longitudinalTuning.kiBP = [0., 5., 22., 35.]
+        ret.longitudinalTuning.kpV = [0.3, 0.3, 0.35, 0.37]
+        ret.longitudinalTuning.kiV = [0.07, 0.07, 0.093, 0.092]
       elif teslaModel == "SD":
-        ret.longitudinalTuning.kpBP = [0., 5., 35.]
-        ret.longitudinalTuning.kpV = [0.50, 0.45, 0.4]
-        ret.longitudinalTuning.kiBP = [0., 5., 35.]
-        ret.longitudinalTuning.kiV = [0.01,0.01,0.01]
+        ret.longitudinalTuning.kpBP = [0., 5., 22., 35.]
+        ret.longitudinalTuning.kpV = [0.50, 0.45, 0.4,0.4]
+        ret.longitudinalTuning.kiBP = [0., 5., 22., 35.]
+        ret.longitudinalTuning.kiV = [0.01,0.01,0.01,0.01]
       elif teslaModel == "SPD":
-        ret.longitudinalTuning.kpBP = [0., 5., 35.]
-        ret.longitudinalTuning.kpV = [0.50, 0.45, 0.4]
-        ret.longitudinalTuning.kiBP = [0., 5., 35.]
-        ret.longitudinalTuning.kiV = [0.009,0.008,0.007]
+        ret.longitudinalTuning.kpBP = [0., 5., 22., 35.]
+        ret.longitudinalTuning.kpV = [0.375, 0.325, 0.325, 0.325]
+        ret.longitudinalTuning.kiBP = [0., 5., 22.,35.]
+        ret.longitudinalTuning.kiV = [0.00915,0.00825,0.00725, 0.00725]
       else:
         #use S numbers if we can't match anything
-        ret.longitudinalTuning.kpBP = [0., 5., 35.]
-        ret.longitudinalTuning.kpV = [0.375, 0.325, 0.3]
-        ret.longitudinalTuning.kiBP = [0., 5., 35.]
-        ret.longitudinalTuning.kiV = [0.08,0.08,0.08]
+        ret.longitudinalTuning.kpBP = [0., 5., 22., 35.]
+        ret.longitudinalTuning.kpV = [0.375, 0.325, 0.3, 0.3]
+        ret.longitudinalTuning.kiBP = [0., 5., 22., 35.]
+        ret.longitudinalTuning.kiV = [0.08,0.08,0.08, 0.08]
       
 
     else:
@@ -198,20 +206,22 @@ class CarInterface(object):
     ret.steerMaxBP = [0.,15.]  # m/s
     ret.steerMaxV = [420.,420.]   # max steer allowed
 
-    ret.gasMaxBP = [0.]  # m/s
-    ret.gasMaxV = [0.3] #if ret.enableGasInterceptor else [0.] # max gas allowed
-    ret.brakeMaxBP = [0., 20.]  # m/s
-    ret.brakeMaxV = [1., 1.]   # max brake allowed - BB: since we are using regen, make this even
+    ret.gasMaxBP = [0., 20.]  # m/s
+    ret.gasMaxV = [0.225, 0.525] #if ret.enableGasInterceptor else [0.] # max gas allowed
+    ret.brakeMaxBP = [0.]  # m/s
+    ret.brakeMaxV = [1.]   # max brake allowed - BB: since we are using regen, make this even
 
-    ret.longitudinalTuning.deadzoneBP = [0., 9.] #BB: added from Toyota to start pedal work; need to tune
-    ret.longitudinalTuning.deadzoneV = [0., 0.] #BB: added from Toyota to start pedal work; need to tune; changed to 0 for now
+    ret.longitudinalTuning.deadzoneBP = [0.] #BB: added from Toyota to start pedal work; need to tune
+    ret.longitudinalTuning.deadzoneV = [0.] #BB: added from Toyota to start pedal work; need to tune; changed to 0 for now
 
     ret.stoppingControl = True
     ret.openpilotLongitudinalControl = True
     ret.steerLimitAlert = False
     ret.startAccel = 0.5
-    ret.steerRateCost = 0.6
+    ret.steerRateCost = 1.0
+
     ret.radarOffCan = not CarSettings().get_value("useTeslaRadar")
+    ret.radarTimeStep = 0.05 #20Hz
 
     return ret
 
@@ -220,11 +230,11 @@ class CarInterface(object):
     # ******************* do can recv *******************
     canMonoTimes = []
 
-    self.cp.update_strings(int(sec_since_boot() * 1e9), can_strings)
+    self.cp.update_strings(can_strings)
     ch_can_valid = self.cp.can_valid
-    self.epas_cp.update_strings(int(sec_since_boot() * 1e9), can_strings)
+    self.epas_cp.update_strings(can_strings)
     epas_can_valid = self.epas_cp.can_valid
-    self.pedal_cp.update_strings(int(sec_since_boot() * 1e9), can_strings)
+    self.pedal_cp.update_strings(can_strings)
     pedal_can_valid = self.pedal_cp.can_valid
 
     can_rcv_error = not (ch_can_valid and epas_can_valid and pedal_can_valid)
@@ -267,35 +277,35 @@ class CarInterface(object):
     ret.gearShifter = self.CS.gear_shifter
 
     ret.steeringTorque = self.CS.steer_torque_driver
-    ret.steeringPressed = self.CS.steer_override or not self.CS.enableDriverMonitor
+    ret.steeringPressed = self.CS.steer_override
 
     # cruise state
     ret.cruiseState.enabled = True #self.CS.pcm_acc_status != 0
-    ret.cruiseState.speed = self.CS.v_cruise_pcm * CV.KPH_TO_MS
+    ret.cruiseState.speed = self.CS.v_cruise_pcm * CV.KPH_TO_MS * (CV.MPH_TO_KPH if self.CS.imperial_speed_units else 1.)
     ret.cruiseState.available = bool(self.CS.main_on)
-    ret.cruiseState.speedOffset = self.CS.cruise_speed_offset
+    ret.cruiseState.speedOffset = 0.
     ret.cruiseState.standstill = False
 
     # TODO: button presses
     buttonEvents = []
-    ret.leftBlinker = bool(self.CS.left_blinker_on)
-    ret.rightBlinker = bool(self.CS.right_blinker_on)
+    ret.leftBlinker = bool(self.CS.turn_signal_state_left == 1)
+    ret.rightBlinker = bool(self.CS.turn_signal_state_right == 1)
 
 
     ret.doorOpen = not self.CS.door_all_closed
     ret.seatbeltUnlatched = not self.CS.seatbelt
 
-    if self.CS.left_blinker_on != self.CS.prev_left_blinker_on:
-      be = car.CarState.ButtonEvent.new_message()
-      be.type = 'leftBlinker'
-      be.pressed = self.CS.left_blinker_on != 0
-      buttonEvents.append(be)
-
-    if self.CS.right_blinker_on != self.CS.prev_right_blinker_on:
-      be = car.CarState.ButtonEvent.new_message()
-      be.type = 'rightBlinker'
-      be.pressed = self.CS.right_blinker_on != 0
-      buttonEvents.append(be)
+    if self.CS.prev_turn_signal_stalk_state != self.CS.turn_signal_stalk_state:
+      if self.CS.turn_signal_stalk_state == 1 or self.CS.prev_turn_signal_stalk_state == 1:
+        be = car.CarState.ButtonEvent.new_message()
+        be.type = 'leftBlinker'
+        be.pressed = self.CS.turn_signal_stalk_state == 1
+        buttonEvents.append(be)
+      if self.CS.turn_signal_stalk_state == 2 or self.CS.prev_turn_signal_stalk_state == 2:
+        be = car.CarState.ButtonEvent.new_message()
+        be.type = 'rightBlinker'
+        be.pressed = self.CS.turn_signal_stalk_state == 2
+        buttonEvents.append(be)
 
     if self.CS.cruise_buttons != self.CS.prev_cruise_buttons:
       be = car.CarState.ButtonEvent.new_message()
@@ -324,7 +334,7 @@ class CarInterface(object):
     ret.buttonEvents = buttonEvents
 
     # events
-    events = []
+    events = self.create_common_events(ret)
 
     #notification messages for DAS
     if (not c.enabled) and (self.CC.opState == 2):
@@ -333,8 +343,9 @@ class CarInterface(object):
       self.CC.opState = 1
     if can_rcv_error:
       self.can_invalid_count += 1
-      if self.can_invalid_count >= 100: #BB increased to 100 to see if we still get the can error messages
-        events.append(create_event('invalidGiraffeHonda', [ET.NO_ENTRY, ET.IMMEDIATE_DISABLE]))
+      if self.can_invalid_count >= 200: #Raf increased to 200 #BB increased to 100 to see if we still get the can error messages
+        events.add(EventName.canError)
+        self.can_invalid_count = 0
         self.CS.DAS_canErrors = 1
         if self.CC.opState == 1:
           self.CC.opState = 2
@@ -342,29 +353,29 @@ class CarInterface(object):
       self.can_invalid_count = 0
     if self.CS.steer_error:
       if not self.CS.enableHSO:
-        events.append(create_event('steerUnavailable', [ET.NO_ENTRY, ET.WARNING]))
+        events.add(EventName.steerUnavailable)
     elif self.CS.steer_warning:
       if not self.CS.enableHSO:
-         events.append(create_event('steerTempUnavailable', [ET.NO_ENTRY, ET.IMMEDIATE_DISABLE]))
+         events.add(EventName.steerTempUnavailable)
          if self.CC.opState == 1:
           self.CC.opState = 2
     if self.CS.brake_error:
-      events.append(create_event('brakeUnavailable', [ET.NO_ENTRY, ET.IMMEDIATE_DISABLE, ET.PERMANENT]))
+      events.add(EventName.brakeUnavailable)
       if self.CC.opState == 1:
           self.CC.opState = 2
     if not ret.gearShifter == 'drive':
-      events.append(create_event('wrongGear', [ET.NO_ENTRY, ET.SOFT_DISABLE]))
+      events.add(EventName.wrongGear)
       if c.enabled:
         self.CC.DAS_222_accCameraBlind = 1
         self.CC.warningCounter = 300
         self.CC.warningNeeded = 1
     if ret.doorOpen:
-      events.append(create_event('doorOpen', [ET.NO_ENTRY, ET.SOFT_DISABLE]))
+      events.add(EventName.doorOpen)
       self.CS.DAS_doorOpen = 1
       if self.CC.opState == 1:
         self.CC.opState = 0
     if ret.seatbeltUnlatched:
-      events.append(create_event('seatbeltNotLatched', [ET.NO_ENTRY, ET.IMMEDIATE_DISABLE]))
+      events.add(EventName.seatbeltNotLatched)
       if c.enabled:
         self.CC.DAS_211_accNoSeatBelt = 1
         self.CC.warningCounter = 300
@@ -372,31 +383,33 @@ class CarInterface(object):
       if self.CC.opState == 1:
         self.CC.opState = 2
     if self.CS.esp_disabled:
-      events.append(create_event('espDisabled', [ET.NO_ENTRY, ET.SOFT_DISABLE]))
+      events.add(EventName.espDisabled)
       if self.CC.opState == 1:
           self.CC.opState = 2
     if not self.CS.main_on:
-      events.append(create_event('wrongCarMode', [ET.NO_ENTRY, ET.IMMEDIATE_DISABLE]))
+      events.add(EventName.wrongCarMode)
       if self.CC.opState == 1:
           self.CC.opState = 0
     if ret.gearShifter == 'reverse':
-      events.append(create_event('reverseGear', [ET.NO_ENTRY, ET.IMMEDIATE_DISABLE]))
+      events.add(EventName.reverseGear)
       self.CS.DAS_notInDrive = 1
       if self.CC.opState == 1:
           self.CC.opState = 0
+    if ret.gearShifter == 'drive':
+        self.CS.DAS_notInDrive =0
     if self.CS.brake_hold:
-      events.append(create_event('brakeHold', [ET.NO_ENTRY, ET.USER_DISABLE]))
+      events.add(EventName.brakeHold)
       if self.CC.opState == 1:
           self.CC.opState = 0
     if self.CS.park_brake:
-      events.append(create_event('parkBrake', [ET.NO_ENTRY, ET.USER_DISABLE]))
+      events.add(EventName.parkBrake)
       if self.CC.opState == 1:
           self.CC.opState = 0
     if (not c.enabled) and (self.CC.opState == 1):
       self.CC.opState = 0
 
     if self.CP.enableCruise and ret.vEgo < self.CP.minEnableSpeed:
-      events.append(create_event('speedTooLow', [ET.NO_ENTRY]))
+      events.add(EventName.speedTooLow)
 
     # Standard OP method to disengage:
     # disable on pedals rising edge or when brake is pressed and speed isn't zero
@@ -410,19 +423,19 @@ class CarInterface(object):
     #else:
     #  if ret.brakePressed:
     #    events.append(create_event('pedalPressed', [ET.NO_ENTRY, ET.USER_DISABLE]))
-    if ret.gasPressed:
-      events.append(create_event('pedalPressed', [ET.PRE_ENABLE]))
+    #if ret.gasPressed:
+    #  events.append(create_event('pedalPressed', [ET.PRE_ENABLE]))
 
     # it can happen that car cruise disables while comma system is enabled: need to
     # keep braking if needed or if the speed is very low
     if self.CP.enableCruise and not ret.cruiseState.enabled and c.actuators.brake <= 0.:
       # non loud alert if cruise disbales below 25mph as expected (+ a little margin)
       if ret.vEgo < self.CP.minEnableSpeed + 2.:
-        events.append(create_event('speedTooLow', [ET.IMMEDIATE_DISABLE]))
+        events.add(EventName.speedTooLow)
       else:
-        events.append(create_event("cruiseDisabled", [ET.IMMEDIATE_DISABLE]))
+        events.add(EventName.cruiseDisabled)
     if self.CS.CP.minEnableSpeed > 0 and ret.vEgo < 0.001:
-      events.append(create_event('manualRestart', [ET.WARNING]))
+      events.add(EventName.manualRestart)
 
     cur_time = self.frame * DT_CTRL
     enable_pressed = False
@@ -431,23 +444,23 @@ class CarInterface(object):
 
       # do enable on both accel and decel buttons
       if b.type == "altButton3" and not b.pressed:
-        print "enabled pressed at", cur_time
+        print ("enabled pressed at", cur_time)
         self.last_enable_pressed = cur_time
         enable_pressed = True
 
       # do disable on button down
       if b.type == "cancel" and b.pressed:
-        events.append(create_event('buttonCancel', [ET.USER_DISABLE]))
+        events.add(EventName.buttonCancel)
 
     if self.CP.enableCruise:
       # KEEP THIS EVENT LAST! send enable event if button is pressed and there are
       # NO_ENTRY events, so controlsd will display alerts. Also not send enable events
       # too close in time, so a no_entry will not be followed by another one.
       # TODO: button press should be the only thing that triggers enble
-      if ((cur_time - self.last_enable_pressed) < 0.2 and
+      if ((cur_time - self.last_enable_pressed) < 0.2 and # pylint: disable=chained-comparison
           (cur_time - self.last_enable_sent) > 0.2 and
           ret.cruiseState.enabled) or \
-         (enable_pressed and get_events(events, [ET.NO_ENTRY])):
+         (enable_pressed and events.any(ET.NO_ENTRY)): 
         if ret.seatbeltUnlatched:
           self.CC.DAS_211_accNoSeatBelt = 1
           self.CC.warningCounter = 300
@@ -461,7 +474,7 @@ class CarInterface(object):
           self.CC.warningCounter = 300
           self.CC.warningNeeded = 1
         else:
-          events.append(create_event('buttonEnable', [ET.ENABLE]))
+          events.add(EventName.buttonEnable)
         self.last_enable_sent = cur_time
     elif enable_pressed:
       if ret.seatbeltUnlatched:
@@ -477,29 +490,17 @@ class CarInterface(object):
         self.CC.warningCounter = 300
         self.CC.warningNeeded = 1
       else:
-        events.append(create_event('buttonEnable', [ET.ENABLE]))
-     
-        
+        events.add(EventName.buttonEnable)
 
-    ret.events = events
+    ret.events = events.to_msg()
     ret.canMonoTimes = canMonoTimes
 
     # update previous brake/gas pressed
     self.gas_pressed_prev = ret.gasPressed
     self.brake_pressed_prev = self.CS.brake_pressed != 0
 
-    #pass ALCA status
-    alca_status = tesla.ALCAStatus.new_message()
-
-    alca_status.alcaEnabled = bool(self.CS.ALCA_enabled)
-    alca_status.alcaTotalSteps = int(self.CS.ALCA_total_steps)
-    alca_status.alcaDirection = int(self.CS.ALCA_direction)
-    alca_status.alcaError = bool(self.CS.ALCA_error)
-
-    self.alca.send(alca_status.to_bytes())
-
-    # cast to reader so it can't be modified
-    return ret.as_reader()
+    self.CS.out = ret.as_reader()
+    return self.CS.out
 
   # pass in a car.CarControl
   # to be called @ 100hz

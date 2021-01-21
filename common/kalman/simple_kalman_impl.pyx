@@ -1,3 +1,5 @@
+# distutils: language = c++
+# cython: language_level=3
 
 cdef class KF1D:
   def __init__(self, x0, A, C, K):

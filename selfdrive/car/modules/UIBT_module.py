@@ -3,6 +3,7 @@ import struct
 from ctypes import create_string_buffer
 import os
 from datetime import datetime
+from common.basedir import BASEDIR
 
 
 buttons_file_rw = "wb"
@@ -22,7 +23,7 @@ class UIButtons:
     def write_buttons_labels_to_file(self):
         fo = open(self.buttons_labels_path, buttons_file_rw)
         for btn in self.btns:
-            fo.write(struct.pack(btn_msg_struct,btn.btn_name,btn.btn_label,btn.btn_label2))
+            fo.write(struct.pack(btn_msg_struct,btn.btn_name.encode('utf8'),btn.btn_label.encode('utf8'),btn.btn_label2.encode('utf8')))
         fo.close()
 
     def read_buttons_labels_from_file(self):
@@ -34,18 +35,22 @@ class UIButtons:
             for i in range(0, len(indata), btn_msg_len):
                 j = int(i/btn_msg_len)
                 name,label,label2 = struct.unpack(btn_msg_struct, indata[i:i+btn_msg_len]) 
-                if self.btns[j].btn_name == name.rstrip("\0"):
+                if self.btns[j].btn_name.rstrip("\0") == name.decode('utf8').rstrip("\0"):
                     file_matches = True
-                    self.btns[j].btn_label = label.rstrip("\0")
+                    self.btns[j].btn_label = label.decode('utf8').rstrip("\0")
                     #check if label is actually a valid option
-                    if label2.rstrip("\0") in self.CS.btns_init[j][2]:
-                        self.btns[j].btn_label2 = label2.rstrip("\0")
+                    if label2.decode('utf8').rstrip("\0") in self.CS.btns_init[j][2]:
+                        self.btns[j].btn_label2 = label2.decode('utf8').rstrip("\0")
+                        print (self.btns[j].btn_name," label2: using last value from file")
                     else:
                         self.btns[j].btn_label2 = self.CS.btns_init[j][2][0]
+                        print (self.btns[j].btn_name," label2: using default value")
+                else:
+                    print(self.btns[j].btn_name," label does not match, using default")
             return file_matches
         else:
             #we don't have all the data, ignore
-            print "labels file is bad"
+            print ("labels file is bad")
             return False
 
 
@@ -64,10 +69,10 @@ class UIButtons:
         fi.close()
         if len(indata) == 6:
             for i in range(0,len(indata)):
-                self.btns[i].btn_status = ord(indata[i]) - 48
+                self.btns[i].btn_status = (indata[i]) - 48
         else:
             #something wrong with the file
-            print "status file is bad"
+            print ("status file is bad")
 
     def send_button_info(self):
         if self.isLive:
@@ -80,8 +85,8 @@ class UIButtons:
         self.CS = carstate
         self.car_folder = folder
         self.car_name = car
-        self.buttons_labels_path = "/data/openpilot/selfdrive/car/"+self.car_folder+"/buttons.msg"
-        self.buttons_status_out_path = "/data/openpilot/selfdrive/car/"+self.car_folder+"/buttons.cc.msg"
+        self.buttons_labels_path = BASEDIR + "/selfdrive/car/"+self.car_folder+"/buttons.msg"
+        self.buttons_status_out_path = BASEDIR + "/selfdrive/car/"+self.car_folder+"/buttons.cc.msg"
         self.btns = []
         self.hasChanges = True
         self.last_in_read_time = datetime.min 
@@ -110,10 +115,10 @@ class UIButtons:
         self.btns = []
         try:
             self.CS.init_ui_buttons()
-            print "Buttons iniatlized with custom CS code"  
+            print ("Buttons iniatlized with custom CS code")  
         except AttributeError:
             # no init method
-            print "Buttons iniatlized with just base code"
+            print ("Buttons iniatlized with just base code")
         for i in range(0,len(self.CS.btns_init)):
             self.btns.append(UIButton(self.CS.btns_init[i][0],self.CS.btns_init[i][1],1,self.CS.btns_init[i][2][0],i))
 
@@ -197,4 +202,4 @@ class UIButtons:
             self.CS.update_ui_buttons(id,btn_status)
         except AttributeError:
             # no update method
-            print "Buttons updated with just base code"
+            print ("Buttons updated with just base code")

@@ -23,12 +23,18 @@ typedef union _USB_Setup {
 }
 USB_Setup_TypeDef;
 
+#define MAX_CAN_MSGS_PER_BULK_TRANSFER 4U
+
+bool usb_eopf_detected = false;
+
 void usb_init(void);
 int usb_cb_control_msg(USB_Setup_TypeDef *setup, uint8_t *resp, bool hardwired);
 int usb_cb_ep1_in(void *usbdata, int len, bool hardwired);
 void usb_cb_ep2_out(void *usbdata, int len, bool hardwired);
 void usb_cb_ep3_out(void *usbdata, int len, bool hardwired);
+void usb_cb_ep3_out_complete(void);
 void usb_cb_enumeration_complete(void);
+void usb_outep3_resume_if_paused(void);
 
 // **** supporting defines ****
 
@@ -281,15 +287,8 @@ uint8_t binary_object_store_desc[] = {
   // BOS header
   BINARY_OBJECT_STORE_DESCRIPTOR_LENGTH, // bLength, this is only the length of the header
   BINARY_OBJECT_STORE_DESCRIPTOR, // bDescriptorType
-  0x40, 0x00, // wTotalLength (LSB, MSB)
-  0x03, // bNumDeviceCaps (USB 2.0 + WebUSB + WinUSB)
-
-  // -------------------------------------------------
-  // USB 2.0 extension descriptor
-  0x07, // bLength, Descriptor size
-  0x10, // bDescriptorType, Device Capability Descriptor Type
-  0x02, // bDevCapabilityType, USB 2.0 extension capability type
-  0x00, 0x00, 0x00, 0x00, // bmAttributes, LIBUSB_BM_LPM_SUPPORT = 2 and its the only option
+  0x39, 0x00, // wTotalLength (LSB, MSB)
+  0x02, // bNumDeviceCaps (WebUSB + WinUSB)
 
   // -------------------------------------------------
   // WebUSB descriptor
@@ -387,6 +386,7 @@ USB_Setup_TypeDef setup;
 uint8_t usbdata[0x100];
 uint8_t* ep0_txdata = NULL;
 uint16_t ep0_txlen = 0;
+bool outep3_processing = false;
 
 // Store the current interface alt setting.
 int current_int0_alt_setting = 0;
@@ -439,7 +439,7 @@ void USB_WritePacket_EP0(uint8_t *src, uint16_t len) {
   USB_WritePacket(src, wplen, 0);
 
   if (wplen < len) {
-    ep0_txdata = src + wplen;
+    ep0_txdata = &src[wplen];
     ep0_txlen = len - wplen;
     USBx_DEVICE->DIEPEMPMSK |= 1;
   } else {
@@ -662,81 +662,15 @@ void usb_setup(void) {
       break;
     default:
       resp_len = usb_cb_control_msg(&setup, resp, 1);
-      USB_WritePacket(resp, MIN(resp_len, setup.b.wLength.w), 0);
-      USBx_OUTEP(0)->DOEPCTL |= USB_OTG_DOEPCTL_CNAK;
+      // response pending if -1 was returned
+      if (resp_len != -1) {
+        USB_WritePacket(resp, MIN(resp_len, setup.b.wLength.w), 0);
+        USBx_OUTEP(0)->DOEPCTL |= USB_OTG_DOEPCTL_CNAK;
+      }
   }
 }
 
-void usb_init(void) {
-  // full speed PHY, do reset and remove power down
-  /*puth(USBx->GRSTCTL);
-  puts(" resetting PHY\n");*/
-  while ((USBx->GRSTCTL & USB_OTG_GRSTCTL_AHBIDL) == 0);
-  //puts("AHB idle\n");
 
-  // reset PHY here
-  USBx->GRSTCTL |= USB_OTG_GRSTCTL_CSRST;
-  while ((USBx->GRSTCTL & USB_OTG_GRSTCTL_CSRST) == USB_OTG_GRSTCTL_CSRST);
-  //puts("reset done\n");
-
-  // internal PHY, force device mode
-  USBx->GUSBCFG = USB_OTG_GUSBCFG_PHYSEL | USB_OTG_GUSBCFG_FDMOD;
-
-  // slowest timings
-  USBx->GUSBCFG |= ((USBD_FS_TRDT_VALUE << 10) & USB_OTG_GUSBCFG_TRDT);
-
-  // power up the PHY
-#ifdef STM32F4
-  USBx->GCCFG = USB_OTG_GCCFG_PWRDWN;
-
-  //USBx->GCCFG |= USB_OTG_GCCFG_VBDEN | USB_OTG_GCCFG_SDEN |USB_OTG_GCCFG_PDEN | USB_OTG_GCCFG_DCDEN;
-
-  /* B-peripheral session valid override enable*/
-  USBx->GOTGCTL |= USB_OTG_GOTGCTL_BVALOVAL;
-  USBx->GOTGCTL |= USB_OTG_GOTGCTL_BVALOEN;
-#else
-  USBx->GCCFG = USB_OTG_GCCFG_PWRDWN | USB_OTG_GCCFG_NOVBUSSENS;
-#endif
-
-  // be a device, slowest timings
-  //USBx->GUSBCFG = USB_OTG_GUSBCFG_FDMOD | USB_OTG_GUSBCFG_PHYSEL | USB_OTG_GUSBCFG_TRDT | USB_OTG_GUSBCFG_TOCAL;
-  //USBx->GUSBCFG |= (uint32_t)((USBD_FS_TRDT_VALUE << 10) & USB_OTG_GUSBCFG_TRDT);
-  //USBx->GUSBCFG = USB_OTG_GUSBCFG_PHYSEL | USB_OTG_GUSBCFG_TRDT | USB_OTG_GUSBCFG_TOCAL;
-
-  // **** for debugging, doesn't seem to work ****
-  //USBx->GUSBCFG |= USB_OTG_GUSBCFG_CTXPKT;
-
-  // reset PHY clock
-  USBx_PCGCCTL = 0;
-
-  // enable the fancy OTG things
-  // DCFG_FRAME_INTERVAL_80 is 0
-  //USBx->GUSBCFG |= USB_OTG_GUSBCFG_HNPCAP | USB_OTG_GUSBCFG_SRPCAP;
-  USBx_DEVICE->DCFG |= USB_OTG_SPEED_FULL | USB_OTG_DCFG_NZLSOHSK;
-
-  //USBx_DEVICE->DCFG = USB_OTG_DCFG_NZLSOHSK | USB_OTG_DCFG_DSPD;
-  //USBx_DEVICE->DCFG = USB_OTG_DCFG_DSPD;
-
-  // clear pending interrupts
-  USBx->GINTSTS = 0xBFFFFFFFU;
-
-  // setup USB interrupts
-  // all interrupts except TXFIFO EMPTY
-  //USBx->GINTMSK = 0xFFFFFFFF & ~(USB_OTG_GINTMSK_NPTXFEM | USB_OTG_GINTMSK_PTXFEM | USB_OTG_GINTSTS_SOF | USB_OTG_GINTSTS_EOPF);
-  //USBx->GINTMSK = 0xFFFFFFFF & ~(USB_OTG_GINTMSK_NPTXFEM | USB_OTG_GINTMSK_PTXFEM);
-  USBx->GINTMSK = USB_OTG_GINTMSK_USBRST | USB_OTG_GINTMSK_ENUMDNEM | USB_OTG_GINTMSK_OTGINT |
-                  USB_OTG_GINTMSK_RXFLVLM | USB_OTG_GINTMSK_GONAKEFFM | USB_OTG_GINTMSK_GINAKEFFM |
-                  USB_OTG_GINTMSK_OEPINT | USB_OTG_GINTMSK_IEPINT | USB_OTG_GINTMSK_USBSUSPM |
-                  USB_OTG_GINTMSK_CIDSCHGM | USB_OTG_GINTMSK_SRQIM | USB_OTG_GINTMSK_MMISM;
-
-  USBx->GAHBCFG = USB_OTG_GAHBCFG_GINT;
-
-  // DCTL startup value is 2 on new chip, 0 on old chip
-  USBx_DEVICE->DCTL = 0;
-
-  // enable the IRQ
-  NVIC_EnableIRQ(OTG_FS_IRQn);
-}
 
 // ***************************** USB port *****************************
 
@@ -765,6 +699,10 @@ void usb_irqhandler(void) {
 
   if ((gintsts & USB_OTG_GINTSTS_ESUSP) != 0) {
     puts("ESUSP detected\n");
+  }
+
+  if ((gintsts & USB_OTG_GINTSTS_EOPF) != 0) {
+    usb_eopf_detected = true;
   }
 
   if ((gintsts & USB_OTG_GINTSTS_USBRST) != 0) {
@@ -820,6 +758,7 @@ void usb_irqhandler(void) {
       }
 
       if (endpoint == 3) {
+        outep3_processing = true;
         usb_cb_ep3_out(usbdata, len, 1);
       }
     } else if (status == STS_SETUP_UPDT) {
@@ -892,15 +831,17 @@ void usb_irqhandler(void) {
       #ifdef DEBUG_USB
         puts("  OUT3 PACKET XFRC\n");
       #endif
-      USBx_OUTEP(3)->DOEPTSIZ = (1U << 19) | 0x40U;
-      USBx_OUTEP(3)->DOEPCTL |= USB_OTG_DOEPCTL_EPENA | USB_OTG_DOEPCTL_CNAK;
+      // NAK cleared by process_can (if tx buffers have room)
+      outep3_processing = false;
+      usb_cb_ep3_out_complete();
     } else if ((USBx_OUTEP(3)->DOEPINT & 0x2000) != 0) {
       #ifdef DEBUG_USB
         puts("  OUT3 PACKET WTF\n");
       #endif
       // if NAK was set trigger this, unknown interrupt
-      USBx_OUTEP(3)->DOEPTSIZ = (1U << 19) | 0x40U;
-      USBx_OUTEP(3)->DOEPCTL |= USB_OTG_DOEPCTL_CNAK;
+      // TODO: why was this here? fires when TX buffers when we can't clear NAK
+      // USBx_OUTEP(3)->DOEPTSIZ = (1U << 19) | 0x40U;
+      // USBx_OUTEP(3)->DOEPCTL |= USB_OTG_DOEPCTL_CNAK;
     } else if ((USBx_OUTEP(3)->DOEPINT) != 0) {
       puts("OUTEP3 error ");
       puth(USBx_OUTEP(3)->DOEPINT);
@@ -985,7 +926,7 @@ void usb_irqhandler(void) {
       if ((ep0_txlen != 0U) && ((USBx_INEP(0)->DTXFSTS & USB_OTG_DTXFSTS_INEPTFSAV) >= 0x40U)) {
         uint16_t len = MIN(ep0_txlen, 0x40);
         USB_WritePacket(ep0_txdata, len, 0);
-        ep0_txdata += len;
+        ep0_txdata = &ep0_txdata[len];
         ep0_txlen -= len;
         if (ep0_txlen == 0U) {
           ep0_txdata = NULL;
@@ -1008,7 +949,16 @@ void usb_irqhandler(void) {
   //USBx->GINTMSK = 0xFFFFFFFF & ~(USB_OTG_GINTMSK_NPTXFEM | USB_OTG_GINTMSK_PTXFEM | USB_OTG_GINTSTS_SOF | USB_OTG_GINTSTS_EOPF);
 }
 
-void OTG_FS_IRQHandler(void) {
+void usb_outep3_resume_if_paused() {
+  ENTER_CRITICAL();
+  if (!outep3_processing && (USBx_OUTEP(3)->DOEPCTL & USB_OTG_DOEPCTL_NAKSTS) != 0) {
+    USBx_OUTEP(3)->DOEPTSIZ = (1U << 19) | 0x40U;
+    USBx_OUTEP(3)->DOEPCTL |= USB_OTG_DOEPCTL_EPENA | USB_OTG_DOEPCTL_CNAK;
+  }
+  EXIT_CRITICAL();
+}
+
+void OTG_FS_IRQ_Handler(void) {
   NVIC_DisableIRQ(OTG_FS_IRQn);
   //__disable_irq();
   usb_irqhandler();
@@ -1016,3 +966,89 @@ void OTG_FS_IRQHandler(void) {
   NVIC_EnableIRQ(OTG_FS_IRQn);
 }
 
+bool usb_enumerated(void) {
+  // This relies on the USB being suspended after no activity for 3ms.
+  // Seems pretty stable in combination with the EOPF to reject noise.
+  bool ret = false;
+  if(!(USBx_DEVICE->DSTS & USB_OTG_DSTS_SUSPSTS)){
+    // Check to see if an end of periodic frame is detected
+    ret = usb_eopf_detected;
+  }
+  usb_eopf_detected = false;
+  return ret;
+}
+
+// ***************************** USB init *****************************
+
+void usb_init(void) {
+  REGISTER_INTERRUPT(OTG_FS_IRQn, OTG_FS_IRQ_Handler, 1500000U, FAULT_INTERRUPT_RATE_USB) //TODO: Find out a better rate limit for USB. Now it's the 1.5MB/s rate
+
+  // full speed PHY, do reset and remove power down
+  /*puth(USBx->GRSTCTL);
+  puts(" resetting PHY\n");*/
+  while ((USBx->GRSTCTL & USB_OTG_GRSTCTL_AHBIDL) == 0);
+  //puts("AHB idle\n");
+
+  // reset PHY here
+  USBx->GRSTCTL |= USB_OTG_GRSTCTL_CSRST;
+  while ((USBx->GRSTCTL & USB_OTG_GRSTCTL_CSRST) == USB_OTG_GRSTCTL_CSRST);
+  //puts("reset done\n");
+
+  // internal PHY, force device mode
+  USBx->GUSBCFG = USB_OTG_GUSBCFG_PHYSEL | USB_OTG_GUSBCFG_FDMOD;
+
+  // slowest timings
+  USBx->GUSBCFG |= ((USBD_FS_TRDT_VALUE << 10) & USB_OTG_GUSBCFG_TRDT);
+
+  // power up the PHY
+#ifdef STM32F4
+  USBx->GCCFG = USB_OTG_GCCFG_PWRDWN;
+
+  //USBx->GCCFG |= USB_OTG_GCCFG_VBDEN | USB_OTG_GCCFG_SDEN |USB_OTG_GCCFG_PDEN | USB_OTG_GCCFG_DCDEN;
+
+  /* B-peripheral session valid override enable*/
+  USBx->GOTGCTL |= USB_OTG_GOTGCTL_BVALOVAL;
+  USBx->GOTGCTL |= USB_OTG_GOTGCTL_BVALOEN;
+#else
+  USBx->GCCFG = USB_OTG_GCCFG_PWRDWN | USB_OTG_GCCFG_NOVBUSSENS;
+#endif
+
+  // be a device, slowest timings
+  //USBx->GUSBCFG = USB_OTG_GUSBCFG_FDMOD | USB_OTG_GUSBCFG_PHYSEL | USB_OTG_GUSBCFG_TRDT | USB_OTG_GUSBCFG_TOCAL;
+  //USBx->GUSBCFG |= (uint32_t)((USBD_FS_TRDT_VALUE << 10) & USB_OTG_GUSBCFG_TRDT);
+  //USBx->GUSBCFG = USB_OTG_GUSBCFG_PHYSEL | USB_OTG_GUSBCFG_TRDT | USB_OTG_GUSBCFG_TOCAL;
+
+  // **** for debugging, doesn't seem to work ****
+  //USBx->GUSBCFG |= USB_OTG_GUSBCFG_CTXPKT;
+
+  // reset PHY clock
+  USBx_PCGCCTL = 0;
+
+  // enable the fancy OTG things
+  // DCFG_FRAME_INTERVAL_80 is 0
+  //USBx->GUSBCFG |= USB_OTG_GUSBCFG_HNPCAP | USB_OTG_GUSBCFG_SRPCAP;
+  USBx_DEVICE->DCFG |= USB_OTG_SPEED_FULL | USB_OTG_DCFG_NZLSOHSK;
+
+  //USBx_DEVICE->DCFG = USB_OTG_DCFG_NZLSOHSK | USB_OTG_DCFG_DSPD;
+  //USBx_DEVICE->DCFG = USB_OTG_DCFG_DSPD;
+
+  // clear pending interrupts
+  USBx->GINTSTS = 0xBFFFFFFFU;
+
+  // setup USB interrupts
+  // all interrupts except TXFIFO EMPTY
+  //USBx->GINTMSK = 0xFFFFFFFF & ~(USB_OTG_GINTMSK_NPTXFEM | USB_OTG_GINTMSK_PTXFEM | USB_OTG_GINTSTS_SOF | USB_OTG_GINTSTS_EOPF);
+  //USBx->GINTMSK = 0xFFFFFFFF & ~(USB_OTG_GINTMSK_NPTXFEM | USB_OTG_GINTMSK_PTXFEM);
+  USBx->GINTMSK = USB_OTG_GINTMSK_USBRST | USB_OTG_GINTMSK_ENUMDNEM | USB_OTG_GINTMSK_OTGINT |
+                  USB_OTG_GINTMSK_RXFLVLM | USB_OTG_GINTMSK_GONAKEFFM | USB_OTG_GINTMSK_GINAKEFFM |
+                  USB_OTG_GINTMSK_OEPINT | USB_OTG_GINTMSK_IEPINT | USB_OTG_GINTMSK_USBSUSPM |
+                  USB_OTG_GINTMSK_CIDSCHGM | USB_OTG_GINTMSK_SRQIM | USB_OTG_GINTMSK_MMISM | USB_OTG_GINTMSK_EOPFM;
+
+  USBx->GAHBCFG = USB_OTG_GAHBCFG_GINT;
+
+  // DCTL startup value is 2 on new chip, 0 on old chip
+  USBx_DEVICE->DCTL = 0;
+
+  // enable the IRQ
+  NVIC_EnableIRQ(OTG_FS_IRQn);
+}

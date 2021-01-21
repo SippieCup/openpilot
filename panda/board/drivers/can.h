@@ -14,6 +14,7 @@ typedef struct {
 
 #define BUS_MAX 4U
 
+uint32_t can_rx_errs = 0;
 uint32_t can_send_errs = 0;
 uint32_t can_fwd_errs = 0;
 uint32_t gmlan_send_errs = 0;
@@ -25,10 +26,16 @@ extern uint32_t can_speed[4];
 
 void can_set_forwarding(int from, int to);
 
-void can_init(uint8_t can_number);
+bool can_init(uint8_t can_number);
 void can_init_all(void);
-void can_send(CAN_FIFOMailBox_TypeDef *to_push, uint8_t bus_number);
+bool can_tx_check_min_slots_free(uint32_t min);
+void can_send(CAN_FIFOMailBox_TypeDef *to_push, uint8_t bus_number, bool skip_tx_hook);
 bool can_pop(can_ring *q, CAN_FIFOMailBox_TypeDef *elem);
+
+// Ignition detected from CAN meessages
+bool ignition_can = false;
+bool ignition_cadillac = false;
+uint32_t ignition_can_cnt = 0U;
 
 // end API
 
@@ -62,7 +69,7 @@ int can_overflow_cnt = 0;
 bool can_pop(can_ring *q, CAN_FIFOMailBox_TypeDef *elem) {
   bool ret = 0;
 
-  enter_critical_section();
+  ENTER_CRITICAL();
   if (q->w_ptr != q->r_ptr) {
     *elem = q->elems[q->r_ptr];
     if ((q->r_ptr + 1U) == q->fifo_size) {
@@ -72,7 +79,7 @@ bool can_pop(can_ring *q, CAN_FIFOMailBox_TypeDef *elem) {
     }
     ret = 1;
   }
-  exit_critical_section();
+  EXIT_CRITICAL();
 
   return ret;
 }
@@ -81,7 +88,7 @@ bool can_push(can_ring *q, CAN_FIFOMailBox_TypeDef *elem) {
   bool ret = false;
   uint32_t next_w_ptr;
 
-  enter_critical_section();
+  ENTER_CRITICAL();
   if ((q->w_ptr + 1U) == q->fifo_size) {
     next_w_ptr = 0;
   } else {
@@ -92,7 +99,7 @@ bool can_push(can_ring *q, CAN_FIFOMailBox_TypeDef *elem) {
     q->w_ptr = next_w_ptr;
     ret = true;
   }
-  exit_critical_section();
+  EXIT_CRITICAL();
   if (!ret) {
     can_overflow_cnt++;
     #ifdef DEBUG
@@ -102,11 +109,25 @@ bool can_push(can_ring *q, CAN_FIFOMailBox_TypeDef *elem) {
   return ret;
 }
 
+uint32_t can_slots_empty(can_ring *q) {
+  uint32_t ret = 0;
+
+  ENTER_CRITICAL();
+  if (q->w_ptr >= q->r_ptr) {
+    ret = q->fifo_size - 1U - q->w_ptr + q->r_ptr;
+  } else {
+    ret = q->r_ptr - q->w_ptr - 1U;
+  }
+  EXIT_CRITICAL();
+
+  return ret;
+}
+
 void can_clear(can_ring *q) {
-  enter_critical_section();
+  ENTER_CRITICAL();
   q->w_ptr = 0;
   q->r_ptr = 0;
-  exit_critical_section();
+  EXIT_CRITICAL();
 }
 
 // assign CAN numbering
@@ -124,43 +145,31 @@ uint8_t bus_lookup[] = {0,1,2};
 uint8_t can_num_lookup[] = {0,1,2,-1};
 int8_t can_forwarding[] = {-1,-1,-1,-1};
 uint32_t can_speed[] = {5000, 5000, 5000, 333};
-#define CAN_MAX 3
+#define CAN_MAX 3U
 
 #define CANIF_FROM_CAN_NUM(num) (cans[num])
 #define CAN_NUM_FROM_CANIF(CAN) ((CAN)==CAN1 ? 0 : ((CAN) == CAN2 ? 1 : 2))
-#define CAN_NAME_FROM_CANIF(CAN) ((CAN)==CAN1 ? "CAN1" : ((CAN) == CAN2 ? "CAN2" : "CAN3"))
 #define BUS_NUM_FROM_CAN_NUM(num) (bus_lookup[num])
 #define CAN_NUM_FROM_BUS_NUM(num) (can_num_lookup[num])
 
 void process_can(uint8_t can_number);
 
-void can_set_speed(uint8_t can_number) {
+bool can_set_speed(uint8_t can_number) {
+  bool ret = true;
   CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
   uint8_t bus_number = BUS_NUM_FROM_CAN_NUM(can_number);
 
-  if (!llcan_set_speed(CAN, can_speed[bus_number], can_loopback, (unsigned int)(can_silent) & (1U << can_number))) {
-    puts("CAN init FAILED!!!!!\n");
-    puth(can_number); puts(" ");
-    puth(BUS_NUM_FROM_CAN_NUM(can_number)); puts("\n");
-  }
-}
-
-void can_init(uint8_t can_number) {
-  if (can_number != 0xffU) {
-    CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
-    can_set_speed(can_number);
-
-    llcan_init(CAN);
-
-    // in case there are queued up messages
-    process_can(can_number);
-  }
+  ret &= llcan_set_speed(CAN, can_speed[bus_number], can_loopback, (unsigned int)(can_silent) & (1U << can_number));
+  return ret;
 }
 
 void can_init_all(void) {
-  for (int i=0; i < CAN_MAX; i++) {
-    can_init(i);
+  bool ret = true;
+  for (uint8_t i=0U; i < CAN_MAX; i++) {
+    can_clear(can_queues[i]);
+    ret &= can_init(i);
   }
+  UNUSED(ret);
 }
 
 void can_flip_buses(uint8_t bus1, uint8_t bus2){
@@ -172,7 +181,7 @@ void can_flip_buses(uint8_t bus1, uint8_t bus2){
 
 // TODO: Cleanup with new abstraction
 void can_set_gmlan(uint8_t bus) {
-  if(hw_type != HW_TYPE_BLACK_PANDA){
+  if(board_has_gmlan()){
     // first, disable GMLAN on prev bus
     uint8_t prev_bus = can_num_lookup[3];
     if (bus != prev_bus) {
@@ -186,7 +195,8 @@ void can_set_gmlan(uint8_t bus) {
           bus_lookup[prev_bus] = prev_bus;
           can_num_lookup[prev_bus] = prev_bus;
           can_num_lookup[3] = -1;
-          can_init(prev_bus);
+          bool ret = can_init(prev_bus);
+          UNUSED(ret);
           break;
         default:
           // GMLAN was not set on either BUS 1 or 2
@@ -205,7 +215,8 @@ void can_set_gmlan(uint8_t bus) {
         bus_lookup[bus] = 3;
         can_num_lookup[bus] = -1;
         can_num_lookup[3] = bus;
-        can_init(bus);
+        bool ret = can_init(bus);
+        UNUSED(ret);
         break;
       case 0xFF:  //-1 unsigned
         break;
@@ -225,7 +236,7 @@ void can_set_obd(uint8_t harness_orientation, bool obd){
   } else {
     puts("setting CAN2 to be normal\n");
   }
-  if(hw_type == HW_TYPE_BLACK_PANDA){
+  if(board_has_obd()){
     if(obd != (bool)(harness_orientation == HARNESS_STATUS_NORMAL)){
         // B5,B6: disable normal mode
         set_gpio_mode(GPIOB, 5, MODE_INPUT);
@@ -242,13 +253,13 @@ void can_set_obd(uint8_t harness_orientation, bool obd){
         set_gpio_mode(GPIOB, 13, MODE_INPUT);
     }
   } else {
-    puts("OBD CAN not available on non-black panda\n");
+    puts("OBD CAN not available on this board\n");
   }
 }
 
 // CAN error
 void can_sce(CAN_TypeDef *CAN) {
-  enter_critical_section();
+  ENTER_CRITICAL();
 
   #ifdef DEBUG
     if (CAN==CAN1) puts("CAN1:  ");
@@ -271,7 +282,7 @@ void can_sce(CAN_TypeDef *CAN) {
 
   can_err_cnt += 1;
   llcan_clear_send(CAN);
-  exit_critical_section();
+  EXIT_CRITICAL();
 }
 
 // ***************************** CAN *****************************
@@ -279,7 +290,7 @@ void can_sce(CAN_TypeDef *CAN) {
 void process_can(uint8_t can_number) {
   if (can_number != 0xffU) {
 
-    enter_critical_section();
+    ENTER_CRITICAL();
 
     CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
     uint8_t bus_number = BUS_NUM_FROM_CAN_NUM(can_number);
@@ -297,7 +308,7 @@ void process_can(uint8_t can_number) {
           to_push.RDTR = (CAN->sTxMailBox[0].TDTR & 0xFFFF000FU) | ((CAN_BUS_RET_FLAG | bus_number) << 4);
           to_push.RDLR = CAN->sTxMailBox[0].TDLR;
           to_push.RDHR = CAN->sTxMailBox[0].TDHR;
-          can_send_errs += !can_push(&can_rx_q, &to_push);
+          can_send_errs += can_push(&can_rx_q, &to_push) ? 0U : 1U;
         }
 
         if ((CAN->TSR & CAN_TSR_TERR0) == CAN_TSR_TERR0) {
@@ -324,10 +335,42 @@ void process_can(uint8_t can_number) {
         CAN->sTxMailBox[0].TDHR = to_send.RDHR;
         CAN->sTxMailBox[0].TDTR = to_send.RDTR;
         CAN->sTxMailBox[0].TIR = to_send.RIR;
+
+        if (can_tx_check_min_slots_free(MAX_CAN_MSGS_PER_BULK_TRANSFER)) {
+          usb_outep3_resume_if_paused();
+        }
       }
     }
 
-    exit_critical_section();
+    EXIT_CRITICAL();
+  }
+}
+
+void ignition_can_hook(CAN_FIFOMailBox_TypeDef *to_push) {
+  int bus = GET_BUS(to_push);
+  int addr = GET_ADDR(to_push);
+  int len = GET_LEN(to_push);
+
+  ignition_can_cnt = 0U;  // reset counter
+
+  if (bus == 0) {
+    // TODO: verify on all supported GM models that we can reliably detect ignition using only this signal,
+    // since the 0x1F1 signal can briefly go low immediately after ignition
+    if ((addr == 0x160) && (len == 5)) {
+      // this message isn't all zeros when ignition is on
+      ignition_cadillac = GET_BYTES_04(to_push) != 0;
+    }
+    // GM exception
+    if ((addr == 0x1F1) && (len == 8)) {
+      // Bit 5 is ignition "on"
+      bool ignition_gm = ((GET_BYTE(to_push, 0) & 0x20) != 0);
+      ignition_can = ignition_gm || ignition_cadillac;
+    }
+    // Tesla exception
+    if ((addr == 0x348) && (len == 8)) {
+      // GTW_status
+      ignition_can = (GET_BYTE(to_push, 0) & 0x1) != 0;
+    }
   }
 }
 
@@ -360,42 +403,50 @@ void can_rx(uint8_t can_number) {
       to_send.RDTR = to_push.RDTR;
       to_send.RDLR = to_push.RDLR;
       to_send.RDHR = to_push.RDHR;
-      can_send(&to_send, bus_fwd_num);
+      can_send(&to_send, bus_fwd_num, true);
     }
 
-    safety_rx_hook(&to_push);
+    can_rx_errs += safety_rx_hook(&to_push) ? 0U : 1U;
+    ignition_can_hook(&to_push);
 
     current_board->set_led(LED_BLUE, true);
-    can_send_errs += !can_push(&can_rx_q, &to_push);
+    can_send_errs += can_push(&can_rx_q, &to_push) ? 0U : 1U;
 
     // next
     CAN->RF0R |= CAN_RF0R_RFOM0;
   }
 }
 
-void CAN1_TX_IRQHandler(void) { process_can(0); }
-void CAN1_RX0_IRQHandler(void) { can_rx(0); }
-void CAN1_SCE_IRQHandler(void) { can_sce(CAN1); }
+void CAN1_TX_IRQ_Handler(void) { process_can(0); }
+void CAN1_RX0_IRQ_Handler(void) { can_rx(0); }
+void CAN1_SCE_IRQ_Handler(void) { can_sce(CAN1); }
 
-void CAN2_TX_IRQHandler(void) { process_can(1); }
-void CAN2_RX0_IRQHandler(void) { can_rx(1); }
-void CAN2_SCE_IRQHandler(void) { can_sce(CAN2); }
+void CAN2_TX_IRQ_Handler(void) { process_can(1); }
+void CAN2_RX0_IRQ_Handler(void) { can_rx(1); }
+void CAN2_SCE_IRQ_Handler(void) { can_sce(CAN2); }
 
-void CAN3_TX_IRQHandler(void) { process_can(2); }
-void CAN3_RX0_IRQHandler(void) { can_rx(2); }
-void CAN3_SCE_IRQHandler(void) { can_sce(CAN3); }
+void CAN3_TX_IRQ_Handler(void) { process_can(2); }
+void CAN3_RX0_IRQ_Handler(void) { can_rx(2); }
+void CAN3_SCE_IRQ_Handler(void) { can_sce(CAN3); }
 
-void can_send(CAN_FIFOMailBox_TypeDef *to_push, uint8_t bus_number) {
-  if (safety_tx_hook(to_push) != 0) {
+bool can_tx_check_min_slots_free(uint32_t min) {
+  return
+    (can_slots_empty(&can_tx1_q) >= min) &&
+    (can_slots_empty(&can_tx2_q) >= min) &&
+    (can_slots_empty(&can_tx3_q) >= min) &&
+    (can_slots_empty(&can_txgmlan_q) >= min);
+}
+
+void can_send(CAN_FIFOMailBox_TypeDef *to_push, uint8_t bus_number, bool skip_tx_hook) {
+  if (skip_tx_hook || safety_tx_hook(to_push) != 0) {
     if (bus_number < BUS_MAX) {
       // add CAN packet to send queue
       // bus number isn't passed through
       to_push->RDTR &= 0xF;
       if ((bus_number == 3U) && (can_num_lookup[3] == 0xFFU)) {
-        // TODO: why uint8 bro? only int8?
-        gmlan_send_errs += !bitbang_gmlan(to_push);
+        gmlan_send_errs += bitbang_gmlan(to_push) ? 0U : 1U;
       } else {
-        can_fwd_errs += !can_push(can_queues[bus_number], to_push);
+        can_fwd_errs += can_push(can_queues[bus_number], to_push) ? 0U : 1U;
         process_can(CAN_NUM_FROM_BUS_NUM(bus_number));
       }
     }
@@ -404,5 +455,28 @@ void can_send(CAN_FIFOMailBox_TypeDef *to_push, uint8_t bus_number) {
 
 void can_set_forwarding(int from, int to) {
   can_forwarding[from] = to;
+}
+
+bool can_init(uint8_t can_number) {
+  bool ret = false;
+
+  REGISTER_INTERRUPT(CAN1_TX_IRQn, CAN1_TX_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)
+  REGISTER_INTERRUPT(CAN1_RX0_IRQn, CAN1_RX0_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)
+  REGISTER_INTERRUPT(CAN1_SCE_IRQn, CAN1_SCE_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)
+  REGISTER_INTERRUPT(CAN2_TX_IRQn, CAN2_TX_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_2)
+  REGISTER_INTERRUPT(CAN2_RX0_IRQn, CAN2_RX0_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_2)
+  REGISTER_INTERRUPT(CAN2_SCE_IRQn, CAN2_SCE_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_2)
+  REGISTER_INTERRUPT(CAN3_TX_IRQn, CAN3_TX_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_3)
+  REGISTER_INTERRUPT(CAN3_RX0_IRQn, CAN3_RX0_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_3)
+  REGISTER_INTERRUPT(CAN3_SCE_IRQn, CAN3_SCE_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_3)
+
+  if (can_number != 0xffU) {
+    CAN_TypeDef *CAN = CANIF_FROM_CAN_NUM(can_number);
+    ret &= can_set_speed(can_number);
+    ret &= llcan_init(CAN);
+    // in case there are queued up messages
+    process_can(can_number);
+  }
+  return ret;
 }
 

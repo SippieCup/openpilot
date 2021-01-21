@@ -2,8 +2,8 @@
 // White Panda //
 // /////////// //
 
-void white_enable_can_transciever(uint8_t transciever, bool enabled) {
-  switch (transciever){
+void white_enable_can_transceiver(uint8_t transceiver, bool enabled) {
+  switch (transceiver){
     case 1U:
       set_gpio_output(GPIOC, 1, !enabled);
       break;
@@ -14,14 +14,16 @@ void white_enable_can_transciever(uint8_t transciever, bool enabled) {
       set_gpio_output(GPIOA, 0, !enabled);
       break;
     default:
-      puts("Invalid CAN transciever ("); puth(transciever); puts("): enabling failed\n");
+      puts("Invalid CAN transceiver ("); puth(transceiver); puts("): enabling failed\n");
       break;
   }
 }
 
-void white_enable_can_transcievers(bool enabled) {
-  for(uint8_t i=1; i<=3U; i++)
-    white_enable_can_transciever(i, enabled);
+void white_enable_can_transceivers(bool enabled) {
+  uint8_t t1 = enabled ? 1U : 2U;  // leave transceiver 1 enabled to detect CAN ignition
+  for(uint8_t i=t1; i<=3U; i++) {
+    white_enable_can_transceiver(i, enabled);
+  }
 }
 
 void white_set_led(uint8_t color, bool enabled) {
@@ -34,7 +36,7 @@ void white_set_led(uint8_t color, bool enabled) {
       break;
     case LED_BLUE:
       set_gpio_output(GPIOC, 6, !enabled);
-      break;  
+      break;
     default:
       break;
   }
@@ -69,19 +71,21 @@ void white_set_usb_power_mode(uint8_t mode){
   }
 }
 
-void white_set_esp_gps_mode(uint8_t mode) {
+void white_set_gps_mode(uint8_t mode) {
   switch (mode) {
-    case ESP_GPS_DISABLED:
+    case GPS_DISABLED:
       // ESP OFF
       set_gpio_output(GPIOC, 14, 0);
       set_gpio_output(GPIOC, 5, 0);
       break;
-    case ESP_GPS_ENABLED:
+#ifndef EON
+    case GPS_ENABLED:
       // ESP ON
       set_gpio_output(GPIOC, 14, 1);
       set_gpio_output(GPIOC, 5, 1);
       break;
-    case ESP_GPS_BOOTMODE:
+#endif
+    case GPS_BOOTMODE:
       set_gpio_output(GPIOC, 14, 1);
       set_gpio_output(GPIOC, 5, 0);
       break;
@@ -125,7 +129,7 @@ void white_set_can_mode(uint8_t mode){
 
       // A8,A15: normal CAN3 mode
       set_gpio_alternate(GPIOA, 8, GPIO_AF11_CAN3);
-      set_gpio_alternate(GPIOA, 15, GPIO_AF11_CAN3);   
+      set_gpio_alternate(GPIOA, 15, GPIO_AF11_CAN3);
       break;
     case CAN_MODE_GMLAN_CAN3:
       // A8,A15: disable CAN3 mode
@@ -143,79 +147,90 @@ void white_set_can_mode(uint8_t mode){
       // B5,B6: normal CAN2 mode
       set_gpio_alternate(GPIOB, 5, GPIO_AF9_CAN2);
       set_gpio_alternate(GPIOB, 6, GPIO_AF9_CAN2);
-      break;  
+      break;
     default:
       puts("Tried to set unsupported CAN mode: "); puth(mode); puts("\n");
       break;
   }
 }
 
-uint64_t marker = 0;
-void white_usb_power_mode_tick(uint64_t tcnt){
-  #ifndef BOOTSTUB
+uint32_t white_read_current(void){
+  return adc_get(ADCCHAN_CURRENT);
+}
+
+uint32_t marker = 0;
+void white_usb_power_mode_tick(uint32_t uptime){
+
+  // on EON or BOOTSTUB, no state machine
+#if !defined(BOOTSTUB) && !defined(EON)
   #define CURRENT_THRESHOLD 0xF00U
   #define CLICKS 5U // 5 seconds to switch modes
 
-  uint32_t current = adc_get(ADCCHAN_CURRENT);
+  uint32_t current = white_read_current();
 
   // ~0x9a = 500 ma
   // puth(current); puts("\n");
 
   switch (usb_power_mode) {
     case USB_POWER_CLIENT:
-      if ((tcnt - marker) >= CLICKS) {
+      if ((uptime - marker) >= CLICKS) {
         if (!is_enumerated) {
           puts("USBP: didn't enumerate, switching to CDP mode\n");
           // switch to CDP
           white_set_usb_power_mode(USB_POWER_CDP);
-          marker = tcnt;
+          marker = uptime;
         }
       }
       // keep resetting the timer if it's enumerated
       if (is_enumerated) {
-        marker = tcnt;
+        marker = uptime;
       }
       break;
     case USB_POWER_CDP:
-      // On the EON, if we get into CDP mode we stay here. No need to go to DCP.
-      #ifndef EON
-        // been CLICKS clicks since we switched to CDP
-        if ((tcnt-marker) >= CLICKS) {
-          // measure current draw, if positive and no enumeration, switch to DCP
-          if (!is_enumerated && (current < CURRENT_THRESHOLD)) {
-            puts("USBP: no enumeration with current draw, switching to DCP mode\n");
-            white_set_usb_power_mode(USB_POWER_DCP);
-            marker = tcnt;
-          }
+      // been CLICKS clicks since we switched to CDP
+      if ((uptime - marker) >= CLICKS) {
+        // measure current draw, if positive and no enumeration, switch to DCP
+        if (!is_enumerated && (current < CURRENT_THRESHOLD)) {
+          puts("USBP: no enumeration with current draw, switching to DCP mode\n");
+          white_set_usb_power_mode(USB_POWER_DCP);
+          marker = uptime;
         }
-        // keep resetting the timer if there's no current draw in CDP
-        if (current >= CURRENT_THRESHOLD) {
-          marker = tcnt;
-        }
-      #endif
+      }
+      // keep resetting the timer if there's no current draw in CDP
+      if (current >= CURRENT_THRESHOLD) {
+        marker = uptime;
+      }
       break;
     case USB_POWER_DCP:
       // been at least CLICKS clicks since we switched to DCP
-      if ((tcnt-marker) >= CLICKS) {
+      if ((uptime - marker) >= CLICKS) {
         // if no current draw, switch back to CDP
         if (current >= CURRENT_THRESHOLD) {
           puts("USBP: no current draw, switching back to CDP mode\n");
           white_set_usb_power_mode(USB_POWER_CDP);
-          marker = tcnt;
+          marker = uptime;
         }
       }
       // keep resetting the timer if there's current draw in DCP
       if (current < CURRENT_THRESHOLD) {
-        marker = tcnt;
+        marker = uptime;
       }
       break;
     default:
       puts("USB power mode invalid\n");  // set_usb_power_mode prevents assigning invalid values
       break;
   }
-  #else
-  UNUSED(tcnt);
-  #endif
+#else
+  UNUSED(uptime);
+#endif
+}
+
+void white_set_ir_power(uint8_t percentage){
+  UNUSED(percentage);
+}
+
+void white_set_fan_power(uint8_t percentage){
+  UNUSED(percentage);
 }
 
 bool white_check_ignition(void){
@@ -223,7 +238,19 @@ bool white_check_ignition(void){
   return !get_gpio_input(GPIOA, 1);
 }
 
-void white_init(void) {
+void white_set_phone_power(bool enabled){
+  UNUSED(enabled);
+}
+
+void white_set_clock_source_mode(uint8_t mode){
+  UNUSED(mode);
+}
+
+void white_set_siren(bool enabled){
+  UNUSED(enabled);
+}
+
+void white_grey_common_init(void) {
   common_init_gpio();
 
   // C3: current sense
@@ -241,9 +268,6 @@ void white_init(void) {
   set_gpio_alternate(GPIOA, 5, GPIO_AF5_SPI1);
   set_gpio_alternate(GPIOA, 6, GPIO_AF5_SPI1);
   set_gpio_alternate(GPIOA, 7, GPIO_AF5_SPI1);
-
-  // Set USB power mode
-  white_set_usb_power_mode(USB_POWER_CLIENT);
 
   // B12: GMLAN, ignition sense, pull up
   set_gpio_pullup(GPIOB, 12, PULL_UP);
@@ -275,8 +299,8 @@ void white_init(void) {
   set_gpio_alternate(GPIOC, 11, GPIO_AF7_USART3);
   set_gpio_pullup(GPIOC, 11, PULL_UP);
 
-  // Enable CAN transcievers
-  white_enable_can_transcievers(true);
+  // Enable CAN transceivers
+  white_enable_can_transceivers(true);
 
   // Disable LEDs
   white_set_led(LED_RED, false);
@@ -285,6 +309,23 @@ void white_init(void) {
 
   // Set normal CAN mode
   white_set_can_mode(CAN_MODE_NORMAL);
+
+  // Init usb power mode
+  uint32_t voltage = adc_get_voltage();
+  // Init in CDP mode only if panda is powered by 12V.
+  // Otherwise a PC would not be able to flash a standalone panda with EON build
+  if (voltage > 8000U) {  // 8V threshold
+    white_set_usb_power_mode(USB_POWER_CDP);
+  } else {
+    white_set_usb_power_mode(USB_POWER_CLIENT);
+  }
+}
+
+void white_init(void) {
+  white_grey_common_init();
+
+  // Set ESP off by default
+  current_board->set_gps_mode(GPS_DISABLED);
 }
 
 const harness_configuration white_harness_config = {
@@ -295,12 +336,18 @@ const board board_white = {
   .board_type = "White",
   .harness_config = &white_harness_config,
   .init = white_init,
-  .enable_can_transciever = white_enable_can_transciever,
-  .enable_can_transcievers = white_enable_can_transcievers,
+  .enable_can_transceiver = white_enable_can_transceiver,
+  .enable_can_transceivers = white_enable_can_transceivers,
   .set_led = white_set_led,
   .set_usb_power_mode = white_set_usb_power_mode,
-  .set_esp_gps_mode = white_set_esp_gps_mode,
+  .set_gps_mode = white_set_gps_mode,
   .set_can_mode = white_set_can_mode,
   .usb_power_mode_tick = white_usb_power_mode_tick,
-  .check_ignition = white_check_ignition
+  .check_ignition = white_check_ignition,
+  .read_current = white_read_current,
+  .set_fan_power = white_set_fan_power,
+  .set_ir_power = white_set_ir_power,
+  .set_phone_power = white_set_phone_power,
+  .set_clock_source_mode = white_set_clock_source_mode,
+  .set_siren = white_set_siren
 };

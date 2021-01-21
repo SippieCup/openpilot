@@ -7,7 +7,7 @@ $Java.outerClassname("Alca");
 
 @0xca61a35dedbd6327;
 
-const interfaceVersion :Float32 = 4.0;
+#const interfaceVersion :Float32 = 4.0;
 
 struct ALCAStatus { 
   # ALCA info
@@ -35,6 +35,7 @@ struct TeslaRadarPoint {
   movingState @3 :UInt8; # 0-indeterminate 1-moving 2-stopped 3-standing
   length @4 :Float32; # length in meters
   obstacleProb @5 :Float32; # probability to be an obstacle
+  timeStamp @6 :UInt64; #timestamp when the pair was received
 }
 
 struct ICCarsLR {
@@ -67,6 +68,12 @@ struct ICLeads {
   lead2trackId @3 :Int8;
   lead2oClass @4 :Int8;
   lead2length @5 :Float32;
+}
+
+struct AHBinfo {
+  source @0 :UInt8; #use 0 for radar, 1 for camera, 2 for other
+  radarCarDetected @1 :Bool;
+  cameraCarDetected @2 :Bool;
 }
 
 struct TeslaLeadPoint {

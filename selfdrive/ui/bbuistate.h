@@ -1,3 +1,6 @@
+#pragma once
+#include "ui.hpp"
+
 const int touch_timeout = 25;
 
 typedef struct UICstmButton {
@@ -7,6 +10,15 @@ typedef struct UICstmButton {
 } UICstmButton;
 
 typedef struct BBUIState {
+    float scr_scale_x;
+    float scr_scale_y;
+    int scr_w;
+    int scr_h;
+    float scr_device_factor;
+    float scr_scissor_offset;
+#if !defined(QCOM) && !defined(QCOM2)
+    Display *scr_display;
+#endif
     int touch_last_x;
     int touch_last_y;
     bool touch_last;
@@ -17,24 +29,19 @@ typedef struct BBUIState {
     char btns_status[6];
     char car_model[40];
     char car_folder[20];
-    zsock_t *uiButtonInfo_sock;
-    void *uiButtonInfo_sock_raw;
-    zsock_t *uiCustomAlert_sock;
-    void *uiCustomAlert_sock_raw;
-    zsock_t *uiSetCar_sock;
-    void *uiSetCar_sock_raw;
-    zsock_t *uiPlaySound_sock;
-    void *uiPlaySound_sock_raw;
-    zsock_t *uiButtonStatus_sock;
-    void *uiButtonStatus_sock_raw; 
-    zsock_t *gps_sock;
-    void *gps_sock_raw;
-    zsock_t *uiGyroInfo_sock;
-    void *uiGyroInfo_sock_raw;
+    Context *ctx;
+    SubSocket *uiButtonInfo_sock;
+    SubSocket *uiCustomAlert_sock;
+    SubSocket *uiSetCar_sock;
+    SubSocket *uiPlaySound_sock;
+    PubSocket *uiButtonStatus_sock;
+    SubSocket *gps_sock;
+    SubSocket *uiGyroInfo_sock;
+    Poller * poller;
     int btns_x[6];
     int btns_y[6];
     int btns_r[6];
-    int custom_message_status;
+    UIStatus custom_message_status;
     char custom_message[120];
     int img_logo;
     int img_logo2;
@@ -62,4 +69,5 @@ typedef struct BBUIState {
     bool chargingEnabled;
     uint16_t fanSpeed;
     bool keepEonOff;
+    bool recording;
 } BBUIState;

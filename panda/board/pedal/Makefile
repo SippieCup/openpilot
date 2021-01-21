@@ -21,12 +21,16 @@ CFLAGS += "-DALLOW_DEBUG"
 canflash: obj/$(PROJ_NAME).bin
 	../../tests/pedal/enter_canloader.py $<
 
+canflash2: obj/$(PROJ_NAME).bin
+	../../tests/pedal/enter_canloader_can2.py $<
+
+
 usbflash: obj/$(PROJ_NAME).bin
 	../../tests/pedal/enter_canloader.py; sleep 0.5
 	PYTHONPATH=../../ python -c "from python import Panda; p = [x for x in [Panda(x) for x in Panda.list()] if x.bootstub]; assert(len(p)==1); p[0].flash('obj/$(PROJ_NAME).bin', reconnect=False)"
 
 recover: obj/bootstub.bin obj/$(PROJ_NAME).bin
-	../../tests/pedal/enter_canloader.py --recover; sleep 0.5
+	../../tests/pedal/enter_canloader_tesla.py --recover; sleep 0.5
 	$(DFU_UTIL) -d 0483:df11 -a 0 -s 0x08004000 -D obj/$(PROJ_NAME).bin
 	$(DFU_UTIL) -d 0483:df11 -a 0 -s 0x08000000:leave -D obj/bootstub.bin
 
@@ -61,7 +65,7 @@ obj/$(PROJ_NAME).bin: obj/$(STARTUP_FILE).o obj/main.o
 obj/bootstub.bin: obj/$(STARTUP_FILE).o obj/bootstub.o obj/sha.o obj/rsa.o
 	$(CC) $(CFLAGS) -o obj/bootstub.$(PROJ_NAME).elf $^
 	$(OBJCOPY) -v -O binary obj/bootstub.$(PROJ_NAME).elf $@
-	
+
 clean:
 	rm -f obj/*
 

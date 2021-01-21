@@ -1,4 +1,4 @@
-#!/usr/bin/env python2.7
+#!/usr/bin/env python3
 
 import unittest
 import os
@@ -6,7 +6,7 @@ import readconfig
 from selfdrive.car.tesla.readconfig import read_config_file, CarSettings
 
 
-class CarSettingsTestClass(object):
+class CarSettingsTestClass():
   forcePedalOverCC = None
   fix1916 = None
 
@@ -171,10 +171,13 @@ class ReadConfigTests(unittest.TestCase):
 
   # Test get_value interface:
   def test_get_value(self):
-    value = CarSettings().get_value("userHandle")
+    config_file_path = "./test_config_file3.cfg"
+    cs = readconfig.CarSettings(optional_config_file_path=config_file_path)
+    value = cs.get_value("userHandle")
     self.assertEqual(value, 'your_tinkla_username')
-    value = CarSettings().get_value("doAutoUpdate")
+    value = cs.get_value("doAutoUpdate")
     self.assertEqual(value, True)
+    os.remove(config_file_path)
 
   def check_defaults(self, cs):
     self.assertEqual(cs.userHandle, 'your_tinkla_username')
@@ -184,9 +187,6 @@ class ReadConfigTests(unittest.TestCase):
     self.assertEqual(cs.enableALCA, True)
     self.assertEqual(cs.enableDasEmulation, False)
     self.assertEqual(cs.enableRadarEmulation, False)
-    self.assertEqual(cs.enableSpeedVariableDesAngle, True)
-    self.assertEqual(cs.enableRollAngleCorrection, False)
-    self.assertEqual(cs.enableFeedForwardAngleCorrection, True)
     self.assertEqual(cs.enableDriverMonitor, True)
     self.assertEqual(cs.enableShowCar, True)
     self.assertEqual(cs.enableShowLogo, True)
@@ -210,6 +210,8 @@ class ReadConfigTests(unittest.TestCase):
     self.assertEqual(cs.fix1916, False)
     self.assertEqual(cs.get_value("userHandle"), 'your_tinkla_username')
     self.assertEqual(cs.get_value("doAutoUpdate"), True)
+    self.assertEqual(cs.shouldLogCanErrors, False)
+    self.assertEqual(cs.shouldLogProcessCommErrors, False)
 
   # Helper methods
 

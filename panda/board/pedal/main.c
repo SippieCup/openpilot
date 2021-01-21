@@ -3,7 +3,11 @@
 #include "libc.h"
 
 #include "main_declarations.h"
+#include "critical.h"
+#include "faults.h"
 
+#include "drivers/registers.h"
+#include "drivers/interrupts.h"
 #include "drivers/llcan.h"
 #include "drivers/llgpio.h"
 #include "drivers/adc.h"
@@ -15,6 +19,7 @@
 #include "drivers/timer.h"
 
 #include "gpio.h"
+#include "crc.h"
 
 #define CAN CAN1
 
@@ -55,22 +60,23 @@ void debug_ring_callback(uart_ring *ring) {
   }
 }
 
-int usb_cb_ep1_in(uint8_t *usbdata, int len, bool hardwired) {
+int usb_cb_ep1_in(void *usbdata, int len, bool hardwired) {
   UNUSED(usbdata);
   UNUSED(len);
   UNUSED(hardwired);
   return 0;
 }
-void usb_cb_ep2_out(uint8_t *usbdata, int len, bool hardwired) {
+void usb_cb_ep2_out(void *usbdata, int len, bool hardwired) {
   UNUSED(usbdata);
   UNUSED(len);
   UNUSED(hardwired);
 }
-void usb_cb_ep3_out(uint8_t *usbdata, int len, bool hardwired) {
+void usb_cb_ep3_out(void *usbdata, int len, bool hardwired) {
   UNUSED(usbdata);
   UNUSED(len);
   UNUSED(hardwired);
 }
+void usb_cb_ep3_out_complete(void) {}
 void usb_cb_enumeration_complete(void) {}
 
 int usb_cb_control_msg(USB_Setup_TypeDef *setup, uint8_t *resp, bool hardwired) {
@@ -83,9 +89,6 @@ int usb_cb_control_msg(USB_Setup_TypeDef *setup, uint8_t *resp, bool hardwired) 
       ur = get_ring_by_number(setup->b.wValue.w);
       if (!ur) {
         break;
-      }
-      if (ur == &esp_ring) {
-        uart_dma_drain();
       }
       // read
       while ((resp_len < MIN(setup->b.wLength.w, MAX_RESP_LEN)) &&
@@ -106,34 +109,27 @@ int usb_cb_control_msg(USB_Setup_TypeDef *setup, uint8_t *resp, bool hardwired) 
 
 // ***************************** pedal can checksum *****************************
 
-uint8_t pedal_checksum(uint8_t *dat, int len) {
-  uint8_t crc = 0xFF;
-  uint8_t poly = 0xD5; // standard crc8
-  int i, j;
-  for (i = len - 1; i >= 0; i--) {
-    crc ^= dat[i];
-    for (j = 0; j < 8; j++) {
-      if ((crc & 0x80U) != 0U) {
-        crc = (uint8_t)((crc << 1) ^ poly);
-      }
-      else {
-        crc <<= 1;
-      }
-    }
+
+// ***************************** tesla can checksum *****************************
+uint8_t tesla_can_cksum(uint8_t *dat, int len, int addr) {
+  int i;
+  uint8_t s = 0;
+  s += ((addr)&0xFF) + ((addr>>8)&0xFF);
+  for (i = 0; i < len; i++) {
+    s = (s + dat[i]) & 0xFF;
   }
-  return crc;
+  return s;
 }
 
 // ***************************** can port *****************************
 
 // addresses to be used on CAN
-#define CAN_GAS_INPUT  0x200
-#define CAN_GAS_OUTPUT 0x201U
+#define CAN_GAS_INPUT  0x551U
+#define CAN_GAS_OUTPUT 0x552U
 #define CAN_GAS_SIZE 6
 #define COUNTER_CYCLE 0xFU
 
-// cppcheck-suppress unusedFunction ; used in headers not included in cppcheck
-void CAN1_TX_IRQHandler(void) {
+void CAN1_TX_IRQ_Handler(void) {
   // clear interrupt
   CAN->TSR |= CAN_TSR_RQCP0;
 }
@@ -155,8 +151,9 @@ uint32_t current_index = 0;
 #define FAULT_INVALID 6U
 uint8_t state = FAULT_STARTUP;
 
-// cppcheck-suppress unusedFunction ; used in headers not included in cppcheck
-void CAN1_RX0_IRQHandler(void) {
+const uint8_t crc_poly = 0xD5;  // standard crc8
+
+void CAN1_RX0_IRQ_Handler(void) {
   while ((CAN->RF0R & CAN_RF0R_FMP0) != 0) {
     #ifdef DEBUG
       puts("CAN RX\n");
@@ -174,6 +171,7 @@ void CAN1_RX0_IRQHandler(void) {
         } else {
           puts("Failed entering Softloader or Bootloader\n");
         }
+        return;
       }
 
       // normal packet
@@ -185,7 +183,7 @@ void CAN1_RX0_IRQHandler(void) {
       uint16_t value_1 = (dat[2] << 8) | dat[3];
       bool enable = ((dat[4] >> 7) & 1U) != 0U;
       uint8_t index = dat[4] & COUNTER_CYCLE;
-      if (pedal_checksum(dat, CAN_GAS_SIZE - 1) == dat[5]) {
+      if (tesla_can_cksum(dat, CAN_GAS_SIZE - 1,CAN_GAS_INPUT) == dat[5]) {
         if (((current_index + 1U) & COUNTER_CYCLE) == index) {
           #ifdef DEBUG
             puts("setting gas ");
@@ -219,8 +217,7 @@ void CAN1_RX0_IRQHandler(void) {
   }
 }
 
-// cppcheck-suppress unusedFunction ; used in headers not included in cppcheck
-void CAN1_SCE_IRQHandler(void) {
+void CAN1_SCE_IRQ_Handler(void) {
   state = FAULT_SCE;
   llcan_clear_send(CAN);
 }
@@ -231,8 +228,7 @@ unsigned int pkt_idx = 0;
 
 int led_value = 0;
 
-// cppcheck-suppress unusedFunction ; used in headers not included in cppcheck
-void TIM3_IRQHandler(void) {
+void TIM3_IRQ_Handler(void) {
   #ifdef DEBUG
     puth(TIM3->CNT);
     puts(" ");
@@ -250,7 +246,7 @@ void TIM3_IRQHandler(void) {
     dat[2] = (pdl1 >> 8) & 0xFFU;
     dat[3] = (pdl1 >> 0) & 0xFFU;
     dat[4] = ((state & 0xFU) << 4) | pkt_idx;
-    dat[5] = pedal_checksum(dat, CAN_GAS_SIZE - 1);
+    dat[5] = tesla_can_cksum(dat, CAN_GAS_SIZE - 1,CAN_GAS_OUTPUT);
     CAN->sTxMailBox[0].TDLR = dat[0] | (dat[1] << 8) | (dat[2] << 16) | (dat[3] << 24);
     CAN->sTxMailBox[0].TDHR = dat[4] | (dat[5] << 8);
     CAN->sTxMailBox[0].TDTR = 6;  // len of packet is 5
@@ -288,8 +284,16 @@ void pedal(void) {
 
   // write the pedal to the DAC
   if (state == NO_FAULT) {
-    dac_set(0, MAX(gas_set_0, pdl0));
-    dac_set(1, MAX(gas_set_1, pdl1));
+    if (pdl0 > 500) {
+      dac_set(0, MAX(gas_set_0, pdl0));
+      dac_set(1, MAX(gas_set_1, pdl1));
+    } else if (gas_set_0 > 0) {
+      dac_set(0, gas_set_0);
+      dac_set(1, gas_set_1);
+    } else {
+      dac_set(0, pdl0);
+      dac_set(1, pdl1);
+    }
   } else {
     dac_set(0, pdl0);
     dac_set(1, pdl1);
@@ -299,13 +303,26 @@ void pedal(void) {
 }
 
 int main(void) {
-  __disable_irq();
+  // Init interrupt table
+  init_interrupts(true);
+
+  REGISTER_INTERRUPT(CAN1_TX_IRQn, CAN1_TX_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)
+  REGISTER_INTERRUPT(CAN1_RX0_IRQn, CAN1_RX0_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)
+  REGISTER_INTERRUPT(CAN1_SCE_IRQn, CAN1_SCE_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)
+
+  // Should run at around 732Hz (see init below)
+  REGISTER_INTERRUPT(TIM3_IRQn, TIM3_IRQ_Handler, 1000U, FAULT_INTERRUPT_RATE_TIM3)
+
+  disable_interrupts();
 
   // init devices
   clock_init();
   peripherals_init();
   detect_configuration();
   detect_board_type();
+
+  // init board
+  current_board->init();
 
 #ifdef PEDAL_USB
   // enable USB
@@ -322,7 +339,8 @@ int main(void) {
     puts("Failed to set llcan speed");
   }
 
-  llcan_init(CAN1);
+  bool ret = llcan_init(CAN1);
+  UNUSED(ret);
 
   // 48mhz / 65536 ~= 732
   timer_init(TIM3, 15);
@@ -331,7 +349,7 @@ int main(void) {
   watchdog_init();
 
   puts("**** INTERRUPTS ON ****\n");
-  __enable_irq();
+  enable_interrupts();
 
   // main pedal loop
   while (1) {

@@ -10,22 +10,23 @@
 #include <inttypes.h>
 #include <libyuv.h>
 #include <sys/resource.h>
+#include <pthread.h>
 
 #include <string>
 #include <iostream>
+#include <fstream>
 #include <fstream>
 #include <streambuf>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <atomic>
 #include <random>
 
 #include <ftw.h>
-
-#include <zmq.h>
-#include <yaml-cpp/yaml.h>
-#include <capnp/serialize.h>
+#ifdef QCOM
 #include <cutils/properties.h>
+#endif
 
 #include "common/version.h"
 #include "common/timing.h"
@@ -34,27 +35,85 @@
 #include "common/visionipc.h"
 #include "common/utilpp.h"
 #include "common/util.h"
-
+#include "camerad/cameras/camera_common.h"
 #include "logger.h"
+#include "messaging.hpp"
+#include "services.h"
 
+#if !(defined(QCOM) || defined(QCOM2))
+// no encoder on PC
+#define DISABLE_ENCODER
+#endif
 
 #ifndef DISABLE_ENCODER
 #include "encoder.h"
-#include "raw_logger.h"
 #endif
 
-#include "cereal/gen/cpp/log.capnp.h"
+#define MAIN_BITRATE 5000000
+#define QCAM_BITRATE 128000
+#define MAIN_FPS 20
+#ifndef QCOM2
+#define MAX_CAM_IDX LOG_CAMERA_ID_DCAMERA
+#define DCAM_BITRATE 2500000
+#else
+#define MAX_CAM_IDX LOG_CAMERA_ID_ECAMERA
+#define DCAM_BITRATE MAIN_BITRATE
+#endif
 
-#define CAMERA_FPS 20
+#define NO_CAMERA_PATIENCE 500 // fall back to time-based rotation if all cameras are dead
+
+LogCameraInfo cameras_logged[LOG_CAMERA_ID_MAX] = {
+  [LOG_CAMERA_ID_FCAMERA] = {
+    .stream_type = VISION_STREAM_YUV,
+    .filename = "fcamera.hevc",
+    .frame_packet_name = "frame",
+    .fps = MAIN_FPS,
+    .bitrate = MAIN_BITRATE,
+    .is_h265 = true,
+    .downscale = false,
+    .has_qcamera = true
+  },
+  [LOG_CAMERA_ID_DCAMERA] = {
+    .stream_type = VISION_STREAM_YUV_FRONT,
+    .filename = "dcamera.hevc",
+    .frame_packet_name = "frontFrame",
+    .fps = MAIN_FPS, // on EONs, more compressed this way
+    .bitrate = DCAM_BITRATE,
+    .is_h265 = true,
+    .downscale = false,
+    .has_qcamera = false
+  },
+  [LOG_CAMERA_ID_ECAMERA] = {
+    .stream_type = VISION_STREAM_YUV_WIDE,
+    .filename = "ecamera.hevc",
+    .frame_packet_name = "wideFrame",
+    .fps = MAIN_FPS,
+    .bitrate = MAIN_BITRATE,
+    .is_h265 = true,
+    .downscale = false,
+    .has_qcamera = false
+  },
+  [LOG_CAMERA_ID_QCAMERA] = {
+    .filename = "qcamera.ts",
+    .fps = MAIN_FPS,
+    .bitrate = QCAM_BITRATE,
+    .is_h265 = false,
+    .downscale = true,
+#ifndef QCOM2
+    .frame_width = 480, .frame_height = 360
+#else
+    .frame_width = 526, .frame_height = 330 // keep pixel count the same?
+#endif
+  },
+};
 #define SEGMENT_LENGTH 60
-#define LOG_ROOT "/data/media/0/realdata"
-#define ENABLE_LIDAR 0
 
-#define RAW_CLIP_LENGTH 100 // 5 seconds at 20fps
-#define RAW_CLIP_FREQUENCY (randrange(61, 8*60)) // once every ~4 minutes
+#define LOG_ROOT "/data/media/0/realdata"
+
 
 namespace {
 
+double randrange(double a, double b) __attribute__((unused));
 double randrange(double a, double b) {
   static std::mt19937 gen(millis_since_boot());
 
@@ -63,61 +122,124 @@ double randrange(double a, double b) {
 }
 
 
-volatile int do_exit = 0;
+volatile sig_atomic_t do_exit = 0;
 static void set_do_exit(int sig) {
   do_exit = 1;
 }
-struct LoggerdState {
-  void *ctx;
-  LoggerState logger;
 
-  std::mutex lock;
+static bool file_exists (const std::string& fn) {
+  std::ifstream f(fn);
+  return f.good();
+}
+
+class RotateState {
+public:
+  SubSocket* fpkt_sock;
+  uint32_t stream_frame_id, log_frame_id, last_rotate_frame_id;
+  bool enabled, should_rotate, initialized;
+
+  RotateState() : fpkt_sock(nullptr), stream_frame_id(0), log_frame_id(0),
+                  last_rotate_frame_id(UINT32_MAX), enabled(false), should_rotate(false), initialized(false) {};
+
+  void waitLogThread() {
+    std::unique_lock<std::mutex> lk(fid_lock);
+    while (stream_frame_id > log_frame_id           //if the log camera is older, wait for it to catch up.
+           && (stream_frame_id - log_frame_id) < 8  // but if its too old then there probably was a discontinuity (visiond restarted)
+           && !do_exit) {
+      cv.wait(lk);
+    }
+  }
+
+  void cancelWait() { cv.notify_one(); }
+
+  void setStreamFrameId(uint32_t frame_id) {
+    fid_lock.lock();
+    stream_frame_id = frame_id;
+    fid_lock.unlock();
+    cv.notify_one();
+  }
+
+  void setLogFrameId(uint32_t frame_id) {
+    fid_lock.lock();
+    log_frame_id = frame_id;
+    fid_lock.unlock();
+    cv.notify_one();
+  }
+
+  void rotate() {
+    if (!enabled) { return; }
+    std::unique_lock<std::mutex> lk(fid_lock);
+    should_rotate = true;
+    last_rotate_frame_id = stream_frame_id;
+  }
+
+  void finish_rotate() {
+    std::unique_lock<std::mutex> lk(fid_lock);
+    should_rotate = false;
+  }
+
+private:
+  std::mutex fid_lock;
   std::condition_variable cv;
+};
+
+struct LoggerdState {
+  Context *ctx;
+  LoggerState logger;
   char segment_path[4096];
-  uint32_t last_frame_id;
-  uint32_t rotate_last_frame_id;
   int rotate_segment;
+  pthread_mutex_t rotate_lock;
+  int num_encoder;
+  std::atomic<int> rotate_seq_id;
+  std::atomic<int> should_close;
+  std::atomic<int> finish_close;
+
+  RotateState rotate_state[LOG_CAMERA_ID_MAX-1];
 };
 LoggerdState s;
 
 #ifndef DISABLE_ENCODER
-void encoder_thread(bool is_streaming, bool raw_clips, bool front) {
-  int err;
+void encoder_thread(RotateState *rotate_state, int cam_idx) {
 
-  if (front) {
-    char *value;
-    const int result = read_db_value(NULL, "RecordFront", &value, NULL);
-    if (result != 0) return;
-    if (value[0] != '1') { free(value); return; }
-    free(value);
-    LOGW("recording front camera");
-
-    set_thread_name("FrontCameraEncoder");
-  } else {
-    set_thread_name("RearCameraEncoder");
+  switch (cam_idx) {
+    case LOG_CAMERA_ID_DCAMERA: {
+      LOGW("recording front camera");
+      set_thread_name("FrontCameraEncoder");
+      break;
+    }
+    case LOG_CAMERA_ID_FCAMERA: {
+      set_thread_name("RearCameraEncoder");
+      break;
+    }
+    case LOG_CAMERA_ID_ECAMERA: {
+      set_thread_name("WideCameraEncoder");
+      break;
+    }
+    default: {
+      LOGE("unexpected camera index provided");
+      assert(false);
+    }
   }
 
   VisionStream stream;
 
   bool encoder_inited = false;
   EncoderState encoder;
+  EncoderState encoder_alt;
+  bool has_encoder_alt = cameras_logged[cam_idx].has_qcamera;
 
   int encoder_segment = -1;
   int cnt = 0;
-
-  void *idx_sock = zmq_socket(s.ctx, ZMQ_PUB);
-  assert(idx_sock);
-  zmq_bind(idx_sock, front ? "tcp://*:8061" : "tcp://*:8015");
+  pthread_mutex_lock(&s.rotate_lock);
+  int my_idx = s.num_encoder;
+  s.num_encoder += 1;
+  pthread_mutex_unlock(&s.rotate_lock);
 
   LoggerHandle *lh = NULL;
 
   while (!do_exit) {
     VisionStreamBufs buf_info;
-    if (front) {
-      err = visionstream_init(&stream, VISION_STREAM_YUV_FRONT, false, &buf_info);
-    } else {
-      err = visionstream_init(&stream, VISION_STREAM_YUV, false, &buf_info);
-    }
+    int err = visionstream_init(&stream, cameras_logged[cam_idx].stream_type, false, &buf_info);
     if (err != 0) {
       LOGD("visionstream connect fail");
       usleep(100000);
@@ -126,22 +248,25 @@ void encoder_thread(bool is_streaming, bool raw_clips, bool front) {
 
     if (!encoder_inited) {
       LOGD("encoder init %dx%d", buf_info.width, buf_info.height);
-      encoder_init(&encoder, front ? "dcamera" : "fcamera", buf_info.width, buf_info.height, CAMERA_FPS, front ? 1000000 : 5000000);
-      encoder_inited = true;
-      if (is_streaming) {
-        encoder.stream_sock_raw = zmq_socket(s.ctx, ZMQ_PUB);
-        assert(encoder.stream_sock_raw);
-        zmq_bind(encoder.stream_sock_raw, "tcp://*:9002");
+      encoder_init(&encoder, cameras_logged[cam_idx].filename,
+                             buf_info.width,
+                             buf_info.height,
+                             cameras_logged[cam_idx].fps,
+                             cameras_logged[cam_idx].bitrate,
+                             cameras_logged[cam_idx].is_h265,
+                             cameras_logged[cam_idx].downscale);
+
+      if (has_encoder_alt) {
+        encoder_init(&encoder_alt, cameras_logged[LOG_CAMERA_ID_QCAMERA].filename,
+                                   cameras_logged[LOG_CAMERA_ID_QCAMERA].frame_width,
+                                   cameras_logged[LOG_CAMERA_ID_QCAMERA].frame_height,
+                                   cameras_logged[LOG_CAMERA_ID_QCAMERA].fps,
+                                   cameras_logged[LOG_CAMERA_ID_QCAMERA].bitrate,
+                                   cameras_logged[LOG_CAMERA_ID_QCAMERA].is_h265,
+                                   cameras_logged[LOG_CAMERA_ID_QCAMERA].downscale);
       }
-    }
 
-    // dont log a raw clip in the first minute
-    double rawlogger_start_time = seconds_since_boot()+RAW_CLIP_FREQUENCY;
-    int rawlogger_clip_cnt = 0;
-    RawLogger *rawlogger = NULL;
-
-    if (raw_clips) {
-      rawlogger = new RawLogger("prcamera", buf_info.width, buf_info.height, CAMERA_FPS);
+      encoder_inited = true;
     }
 
     while (!do_exit) {
@@ -152,115 +277,110 @@ void encoder_thread(bool is_streaming, bool raw_clips, bool front) {
         break;
       }
 
-      uint64_t current_time = nanos_since_boot();
-      uint64_t diff = current_time - extra.timestamp_eof;
-      double msdiff = (double) diff / 1000000.0;
+      //uint64_t current_time = nanos_since_boot();
+      //uint64_t diff = current_time - extra.timestamp_eof;
+      //double msdiff = (double) diff / 1000000.0;
       // printf("logger latency to tsEof: %f\n", msdiff);
 
-      uint8_t *y = (uint8_t*)buf->addr;
-      uint8_t *u = y + (buf_info.width*buf_info.height);
-      uint8_t *v = u + (buf_info.width/2)*(buf_info.height/2);
+      { // all the rotation stuff
 
-      {
-        bool should_rotate = false;
-        std::unique_lock<std::mutex> lk(s.lock);
-        if (!front) {
-          // wait if log camera is older on back camera
-          while ( extra.frame_id > s.last_frame_id //if the log camera is older, wait for it to catch up.
-                 && (extra.frame_id-s.last_frame_id) < 8 // but if its too old then there probably was a discontinuity (visiond restarted)
-                 && !do_exit) {
-            s.cv.wait(lk);
-          }
-          should_rotate = extra.frame_id > s.rotate_last_frame_id && encoder_segment < s.rotate_segment;
-        } else {
-          // front camera is best effort
-          should_rotate = encoder_segment < s.rotate_segment;
-        }
+        pthread_mutex_lock(&s.rotate_lock);
+        pthread_mutex_unlock(&s.rotate_lock);
+
+        // wait if camera pkt id is older than stream
+        rotate_state->waitLogThread();
+
         if (do_exit) break;
 
         // rotate the encoder if the logger is on a newer segment
-        if (should_rotate) {
-          LOG("rotate encoder to %s", s.segment_path);
-
-          encoder_rotate(&encoder, s.segment_path, s.rotate_segment);
-
-          if (raw_clips) {
-            rawlogger->Rotate(s.segment_path, s.rotate_segment);
+        if (rotate_state->should_rotate) {
+          if (!rotate_state->initialized) {
+            rotate_state->last_rotate_frame_id = extra.frame_id - 1;
+            rotate_state->initialized = true;
           }
-
+          while (s.rotate_seq_id != my_idx && !do_exit) { usleep(1000); }
+          LOGW("camera %d rotate encoder to %s.", cam_idx, s.segment_path);
+          encoder_rotate(&encoder, s.segment_path, s.rotate_segment);
+          s.rotate_seq_id = (my_idx + 1) % s.num_encoder;
+          if (has_encoder_alt) {
+            encoder_rotate(&encoder_alt, s.segment_path, s.rotate_segment);
+          }
           encoder_segment = s.rotate_segment;
           if (lh) {
             lh_close(lh);
           }
           lh = logger_get_handle(&s.logger);
+
+          pthread_mutex_lock(&s.rotate_lock);
+          s.should_close += 1;
+          pthread_mutex_unlock(&s.rotate_lock);
+
+          while(s.should_close > 0 && s.should_close < s.num_encoder && !do_exit) { usleep(1000); }
+
+          pthread_mutex_lock(&s.rotate_lock);
+          s.should_close = s.should_close == s.num_encoder ? 1 - s.num_encoder : s.should_close + 1;
+
+          encoder_close(&encoder);
+          encoder_open(&encoder, encoder.next_path);
+          encoder.segment = encoder.next_segment;
+          encoder.rotating = false;
+          if (has_encoder_alt) {
+            encoder_close(&encoder_alt);
+            encoder_open(&encoder_alt, encoder_alt.next_path);
+            encoder_alt.segment = encoder_alt.next_segment;
+            encoder_alt.rotating = false;
+          }
+          s.finish_close += 1;
+          pthread_mutex_unlock(&s.rotate_lock);
+
+          while(s.finish_close > 0 && s.finish_close < s.num_encoder && !do_exit) { usleep(1000); }
+          s.finish_close = 0;
+
+          rotate_state->finish_rotate();
         }
       }
 
+      rotate_state->setStreamFrameId(extra.frame_id);
+
+      uint8_t *y = (uint8_t*)buf->addr;
+      uint8_t *u = y + (buf_info.width*buf_info.height);
+      uint8_t *v = u + (buf_info.width/2)*(buf_info.height/2);
       {
         // encode hevc
         int out_segment = -1;
-        int out_id = encoder_encode_frame(&encoder, cnt*50000ULL,
-                                          y, u, v, &out_segment, &extra);
+        int out_id = encoder_encode_frame(&encoder,
+                                          y, u, v,
+                                          buf_info.width, buf_info.height,
+                                          &out_segment, &extra);
+        if (has_encoder_alt) {
+          int out_segment_alt = -1;
+          encoder_encode_frame(&encoder_alt,
+                               y, u, v,
+                               buf_info.width, buf_info.height,
+                               &out_segment_alt, &extra);
+        }
 
         // publish encode index
-        capnp::MallocMessageBuilder msg;
-        cereal::Event::Builder event = msg.initRoot<cereal::Event>();
-        event.setLogMonoTime(nanos_since_boot());
-        auto eidx = event.initEncodeIdx();
+        MessageBuilder msg;
+        // this is really ugly
+        auto eidx = cam_idx == LOG_CAMERA_ID_DCAMERA ? msg.initEvent().initFrontEncodeIdx() :
+                    (cam_idx == LOG_CAMERA_ID_ECAMERA ? msg.initEvent().initWideEncodeIdx() : msg.initEvent().initEncodeIdx());
         eidx.setFrameId(extra.frame_id);
-        eidx.setType(front ? cereal::EncodeIndex::Type::FRONT : cereal::EncodeIndex::Type::FULL_H_E_V_C);
+        eidx.setTimestampSof(extra.timestamp_sof);
+        eidx.setTimestampEof(extra.timestamp_eof);
+  #ifdef QCOM2
+        eidx.setType(cereal::EncodeIndex::Type::FULL_H_E_V_C);
+  #else
+        eidx.setType(cam_idx == LOG_CAMERA_ID_DCAMERA ? cereal::EncodeIndex::Type::FRONT:cereal::EncodeIndex::Type::FULL_H_E_V_C);
+  #endif
+
         eidx.setEncodeId(cnt);
         eidx.setSegmentNum(out_segment);
         eidx.setSegmentId(out_id);
 
-        auto words = capnp::messageToFlatArray(msg);
-        auto bytes = words.asBytes();
-        if (zmq_send(idx_sock, bytes.begin(), bytes.size(), 0) < 0) {
-          printf("err sending encodeIdx pkt: %s\n", strerror(errno));
-        }
+        auto bytes = msg.toBytes();
         if (lh) {
           lh_log(lh, bytes.begin(), bytes.size(), false);
-        }
-      }
-
-      if (raw_clips) {
-        double ts = seconds_since_boot();
-        if (ts > rawlogger_start_time) {
-          // encode raw if in clip
-          int out_segment = -1;
-          int out_id = rawlogger->LogFrame(cnt, y, u, v, &out_segment);
-
-          if (rawlogger_clip_cnt == 0) {
-            LOG("starting raw clip in seg %d", out_segment);
-          }
-
-          // publish encode index
-          capnp::MallocMessageBuilder msg;
-          cereal::Event::Builder event = msg.initRoot<cereal::Event>();
-          event.setLogMonoTime(nanos_since_boot());
-          auto eidx = event.initEncodeIdx();
-          eidx.setFrameId(extra.frame_id);
-          eidx.setType(cereal::EncodeIndex::Type::FULL_LOSSLESS_CLIP);
-          eidx.setEncodeId(cnt);
-          eidx.setSegmentNum(out_segment);
-          eidx.setSegmentId(out_id);
-
-          auto words = capnp::messageToFlatArray(msg);
-          auto bytes = words.asBytes();
-          if (lh) {
-            lh_log(lh, bytes.begin(), bytes.size(), false);
-          }
-
-          // close rawlogger if clip ended
-          rawlogger_clip_cnt++;
-          if (rawlogger_clip_cnt >= RAW_CLIP_LENGTH) {
-            rawlogger->Close();
-
-            rawlogger_clip_cnt = 0;
-            rawlogger_start_time = ts+RAW_CLIP_FREQUENCY;
-
-            LOG("ending raw clip in seg %d, next in %.1f sec", out_segment, rawlogger_start_time-ts);
-          }
         }
       }
 
@@ -272,11 +392,6 @@ void encoder_thread(bool is_streaming, bool raw_clips, bool front) {
       lh = NULL;
     }
 
-    if (raw_clips) {
-      rawlogger->Close();
-      delete rawlogger;
-    }
-
     visionstream_destroy(&stream);
   }
 
@@ -285,78 +400,12 @@ void encoder_thread(bool is_streaming, bool raw_clips, bool front) {
     encoder_close(&encoder);
     encoder_destroy(&encoder);
   }
-}
-#endif
 
-#if ENABLE_LIDAR
-
-#include <netinet/in.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-
-#define VELODYNE_DATA_PORT 2368
-#define VELODYNE_TELEMETRY_PORT 8308
-
-#define MAX_LIDAR_PACKET 2048
-
-int lidar_thread() {
-  // increase kernel max buffer size
-  system("sysctl -w net.core.rmem_max=26214400");
-  set_thread_name("lidar");
-
-  int sock;
-  if ((sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-    perror("cannot create socket");
-    return -1;
+  if (has_encoder_alt) {
+    LOG("encoder alt destroy");
+    encoder_close(&encoder_alt);
+    encoder_destroy(&encoder_alt);
   }
-
-  int a = 26214400;
-  if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &a, sizeof(int)) == -1) {
-    perror("cannot set socket opts");
-    return -1;
-  }
-
-  struct sockaddr_in addr;
-  memset(&addr, 0, sizeof(struct sockaddr_in));
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(VELODYNE_DATA_PORT);
-  inet_aton("192.168.5.11", &(addr.sin_addr));
-
-  if (bind(sock, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
-    perror("cannot bind LIDAR socket");
-    return -1;
-  }
-
-  capnp::byte buf[MAX_LIDAR_PACKET];
-
-  while (!do_exit) {
-    // receive message
-    struct sockaddr from;
-    socklen_t fromlen = sizeof(from);
-    int cnt = recvfrom(sock, (void *)buf, MAX_LIDAR_PACKET, 0, &from, &fromlen);
-    if (cnt <= 0) {
-      printf("bug in lidar recieve!\n");
-      continue;
-    }
-
-    // create message for log
-    capnp::MallocMessageBuilder msg;
-    auto event = msg.initRoot<cereal::Event>();
-    event.setLogMonoTime(nanos_since_boot());
-    auto lidar_pts = event.initLidarPts();
-
-    // copy in the buffer
-    // TODO: can we remove this copy? does it matter?
-    kj::ArrayPtr<capnp::byte> bufferPtr = kj::arrayPtr(buf, cnt);
-    lidar_pts.setPkt(bufferPtr);
-
-    // log it
-    auto words = capnp::messageToFlatArray(msg);
-    auto bytes = words.asBytes();
-    logger_log(&s.logger, bytes.begin(), bytes.size());
-  }
-  return 0;
 }
 #endif
 
@@ -370,12 +419,17 @@ void append_property(const char* key, const char* value, void *cookie) {
 }
 
 kj::Array<capnp::word> gen_init_data() {
-  capnp::MallocMessageBuilder msg;
-  auto event = msg.initRoot<cereal::Event>();
-  event.setLogMonoTime(nanos_since_boot());
-  auto init = event.initInitData();
+  MessageBuilder msg;
+  auto init = msg.initEvent().initInitData();
 
-  init.setDeviceType(cereal::InitData::DeviceType::NEO);
+  if (file_exists("/EON"))
+    init.setDeviceType(cereal::InitData::DeviceType::NEO);
+  else if (file_exists("/TICI")) {
+    init.setDeviceType(cereal::InitData::DeviceType::TICI);
+  } else {
+    init.setDeviceType(cereal::InitData::DeviceType::PC);
+  }
+
   init.setVersion(capnp::Text::Reader(COMMA_VERSION));
 
   std::ifstream cmdline_stream("/proc/cmdline");
@@ -392,6 +446,7 @@ kj::Array<capnp::word> gen_init_data() {
 
   init.setKernelVersion(util::read_file("/proc/version"));
 
+#ifdef QCOM
   {
     std::vector<std::pair<std::string, std::string> > properties;
     property_list(append_property, (void*)&properties);
@@ -403,6 +458,7 @@ kj::Array<capnp::word> gen_init_data() {
       lentry.setValue(properties[i].second);
     }
   }
+#endif
 
   const char* dongle_id = getenv("DONGLE_ID");
   if (dongle_id) {
@@ -413,64 +469,38 @@ kj::Array<capnp::word> gen_init_data() {
   if (!clean) {
     init.setDirty(true);
   }
+  Params params = Params();
 
-  char* git_commit = NULL;
-  read_db_value(NULL, "GitCommit", &git_commit, NULL);
-  if (git_commit) {
-    init.setGitCommit(capnp::Text::Reader(git_commit));
+  std::vector<char> git_commit = params.read_db_bytes("GitCommit");
+  if (git_commit.size() > 0) {
+    init.setGitCommit(capnp::Text::Reader(git_commit.data(), git_commit.size()));
   }
 
-  char* git_branch = NULL;
-  read_db_value(NULL, "GitBranch", &git_branch, NULL);
-  if (git_branch) {
-    init.setGitBranch(capnp::Text::Reader(git_branch));
+  std::vector<char> git_branch = params.read_db_bytes("GitBranch");
+  if (git_branch.size() > 0) {
+    init.setGitBranch(capnp::Text::Reader(git_branch.data(), git_branch.size()));
   }
 
-  char* git_remote = NULL;
-  read_db_value(NULL, "GitRemote", &git_remote, NULL);
-  if (git_remote) {
-    init.setGitRemote(capnp::Text::Reader(git_remote));
+  std::vector<char> git_remote = params.read_db_bytes("GitRemote");
+  if (git_remote.size() > 0) {
+    init.setGitRemote(capnp::Text::Reader(git_remote.data(), git_remote.size()));
   }
 
-  char* passive = NULL;
-  read_db_value(NULL, "Passive", &passive, NULL);
-  init.setPassive(passive && strlen(passive) && passive[0] == '1');
-
-
+  init.setPassive(params.read_db_bool("Passive"));
   {
     // log params
-    std::map<std::string, std::string> params;
-    read_db_all(NULL, &params);
-    auto lparams = init.initParams().initEntries(params.size());
+    std::map<std::string, std::string> params_map;
+    params.read_db_all(&params_map);
+    auto lparams = init.initParams().initEntries(params_map.size());
     int i = 0;
-    for (auto& kv : params) {
+    for (auto& kv : params_map) {
       auto lentry = lparams[i];
       lentry.setKey(kv.first);
       lentry.setValue(kv.second);
       i++;
     }
   }
-
-
-  auto words = capnp::messageToFlatArray(msg);
-
-  if (git_commit) {
-    free((void*)git_commit);
-  }
-
-  if (git_branch) {
-    free((void*)git_branch);
-  }
-
-  if (git_remote) {
-    free((void*)git_remote);
-  }
-
-  if (passive) {
-    free((void*)passive);
-  }
-
-  return words;
+  return capnp::messageToFlatArray(msg);
 }
 
 static int clear_locks_fn(const char* fpath, const struct stat *sb, int tyupeflag) {
@@ -499,11 +529,8 @@ static void bootlog() {
   LOGW("bootlog to %s", s.segment_path);
 
   {
-    capnp::MallocMessageBuilder msg;
-    auto event = msg.initRoot<cereal::Event>();
-    event.setLogMonoTime(nanos_since_boot());
-
-    auto boot = event.initBoot();
+    MessageBuilder msg;
+    auto boot = msg.initEvent().initBoot();
 
     boot.setWallTimeNanos(nanos_since_epoch());
 
@@ -513,8 +540,10 @@ static void bootlog() {
     std::string lastPmsg = util::read_file("/sys/fs/pstore/pmsg-ramoops-0");
     boot.setLastPmsg(capnp::Data::Reader((const kj::byte*)lastPmsg.data(), lastPmsg.size()));
 
-    auto words = capnp::messageToFlatArray(msg);
-    auto bytes = words.asBytes();
+    std::string launchLog = util::read_file("/tmp/launch_log");
+    boot.setLaunchLog(capnp::Text::Reader(launchLog.data(), launchLog.size()));
+
+    auto bytes = msg.toBytes();
     logger_log(&s.logger, bytes.begin(), bytes.size(), false);
   }
 
@@ -524,84 +553,56 @@ static void bootlog() {
 int main(int argc, char** argv) {
   int err;
 
+#ifdef QCOM
+  setpriority(PRIO_PROCESS, 0, -12);
+#endif
+
   if (argc > 1 && strcmp(argv[1], "--bootlog") == 0) {
     bootlog();
     return 0;
   }
 
-  setpriority(PRIO_PROCESS, 0, -12);
+  int segment_length = SEGMENT_LENGTH;
+  if (getenv("LOGGERD_TEST")) {
+    segment_length = atoi(getenv("LOGGERD_SEGMENT_LENGTH"));
+  }
+  bool record_front = true;
+#ifndef QCOM2
+  record_front = Params().read_db_bool("RecordFront");
+#endif
 
   clear_locks();
 
   signal(SIGINT, (sighandler_t)set_do_exit);
   signal(SIGTERM, (sighandler_t)set_do_exit);
 
-  s.ctx = zmq_ctx_new();
-  assert(s.ctx);
-
-  std::set<void *> ts_replace_sock;
-
-  std::string exe_dir = util::dir_name(util::readlink("/proc/self/exe"));
-  std::string service_list_path = exe_dir + "/../service_list.yaml";
+  s.ctx = Context::create();
+  Poller * poller = Poller::create();
 
   // subscribe to all services
 
-  void *frame_sock = NULL;
+  std::vector<SubSocket*> socks;
 
-  // zmq_poll is slow because it has to be careful because the signaling
-  // fd is edge-triggered. we can be faster by knowing that we're not messing with it
-  // other than draining and polling
-  std::vector<struct pollfd> polls;
-  std::vector<void*> socks;
+  std::map<SubSocket*, int> qlog_counter;
+  std::map<SubSocket*, int> qlog_freqs;
 
-  std::map<void*, int> qlog_counter;
-  std::map<void*, int> qlog_freqs;
+  for (const auto& it : services) {
+    std::string name = it.name;
 
-  YAML::Node service_list = YAML::LoadFile(service_list_path);
-  for (const auto& it : service_list) {
-    auto name = it.first.as<std::string>();
-    int port = it.second[0].as<int>();
-    bool should_log = it.second[1].as<bool>();
-    int qlog_freq = it.second[3] ? it.second[3].as<int>() : 0;
-
-    if (should_log) {
-      void* sock = zmq_socket(s.ctx, ZMQ_SUB);
-      zmq_setsockopt(sock, ZMQ_SUBSCRIBE, "", 0);
-
-      // make zmq will do exponential backoff from 100ms to 500ms for socket reconnects
-      int reconnect_ivl = 500;
-      zmq_setsockopt(sock, ZMQ_RECONNECT_IVL_MAX, &reconnect_ivl, sizeof(reconnect_ivl));
-
-      std::stringstream ss;
-      ss << "tcp://";
-      if (it.second[4]) {
-        ss << it.second[4].as<std::string>();
-        ts_replace_sock.insert(sock);
-      } else{
-        ss << "127.0.0.1";
-      }
-      ss << ":" << port;
-
-      zmq_connect(sock, ss.str().c_str());
-
-      struct pollfd pfd = {0};
-      size_t fd_size = sizeof(pfd.fd);
-      err = zmq_getsockopt(sock, ZMQ_FD, &pfd.fd, &fd_size);
-      assert(err == 0);
-      pfd.events = POLLIN;
-      polls.push_back(pfd);
+    if (it.should_log) {
+      SubSocket * sock = SubSocket::create(s.ctx, name);
+      assert(sock != NULL);
+      poller->registerSocket(sock);
       socks.push_back(sock);
 
-      if (name == "frame") {
-        LOGD("found frame sock at port %d", port);
-        frame_sock = sock;
+      for (int cid=0;cid<=MAX_CAM_IDX;cid++) {
+        if (name == cameras_logged[cid].frame_packet_name) { s.rotate_state[cid].fpkt_sock = sock; }
       }
 
-      qlog_counter[sock] = (qlog_freq == 0) ? -1 : 0;
-      qlog_freqs[sock] = qlog_freq;
+      qlog_counter[sock] = (it.decimation == -1) ? -1 : 0;
+      qlog_freqs[sock] = it.decimation;
     }
   }
-
 
   {
     auto words = gen_init_data();
@@ -609,140 +610,127 @@ int main(int argc, char** argv) {
     logger_init(&s.logger, "rlog", bytes.begin(), bytes.size(), true);
   }
 
-  bool is_streaming = false;
-  bool is_logging = true;
-
-  if (argc > 1 && strcmp(argv[1], "--stream") == 0) {
-    is_streaming = true;
-  } else if (argc > 1 && strcmp(argv[1], "--only-stream") == 0) {
-    is_streaming = true;
-    is_logging = false;
-  }
-
-  if (is_logging) {
-    err = logger_next(&s.logger, LOG_ROOT, s.segment_path, sizeof(s.segment_path), &s.rotate_segment);
-    assert(err == 0);
-    LOGW("logging to %s", s.segment_path);
-  }
-
-  double start_ts = seconds_since_boot();
-  double last_rotate_ts = start_ts;
-
+  s.rotate_seq_id = 0;
+  s.should_close = 0;
+  s.finish_close = 0;
+  s.num_encoder = 0;
+  pthread_mutex_init(&s.rotate_lock, NULL);
 #ifndef DISABLE_ENCODER
   // rear camera
-  std::thread encoder_thread_handle(encoder_thread, is_streaming, false, false);
-
+  std::thread encoder_thread_handle(encoder_thread, &s.rotate_state[LOG_CAMERA_ID_FCAMERA], LOG_CAMERA_ID_FCAMERA);
+  s.rotate_state[LOG_CAMERA_ID_FCAMERA].enabled = true;
   // front camera
-  std::thread front_encoder_thread_handle(encoder_thread, false, false, true);
-#endif
-
-#if ENABLE_LIDAR
-  std::thread lidar_thread_handle(lidar_thread);
+  std::thread front_encoder_thread_handle;
+  if (record_front) {
+    front_encoder_thread_handle = std::thread(encoder_thread, &s.rotate_state[LOG_CAMERA_ID_DCAMERA], LOG_CAMERA_ID_DCAMERA);
+    s.rotate_state[LOG_CAMERA_ID_DCAMERA].enabled = true;
+  }
+  #ifdef QCOM2
+  // wide camera
+  std::thread wide_encoder_thread_handle(encoder_thread, &s.rotate_state[LOG_CAMERA_ID_ECAMERA], LOG_CAMERA_ID_ECAMERA);
+  s.rotate_state[LOG_CAMERA_ID_ECAMERA].enabled = true;
+  #endif
 #endif
 
   uint64_t msg_count = 0;
   uint64_t bytes_count = 0;
+  kj::Array<capnp::word> buf = kj::heapArray<capnp::word>(1024);
 
+  double start_ts = seconds_since_boot();
+  double last_rotate_tms = millis_since_boot();
+  double last_camera_seen_tms = millis_since_boot();
   while (!do_exit) {
-    // err = zmq_poll(polls.data(), polls.size(), 100 * 1000);
-    err = poll(polls.data(), polls.size(), 100*1000);
-    if (err < 0) break;
-
-    for (int i=0; i<polls.size(); i++) {
-      if (!polls[i].revents) continue;
-
+   for (auto sock : poller->poll(100 * 1000)) {
+     Message * last_msg = nullptr;
       while (true) {
-        zmq_msg_t msg;
-        zmq_msg_init(&msg);
-
-        err = zmq_msg_recv(&msg, socks[i], ZMQ_DONTWAIT);
-        if (err < 0) {
-          zmq_msg_close(&msg);
+        Message * msg = sock->receive(true);
+        if (msg == NULL){
           break;
         }
+        delete last_msg;
+        last_msg = msg;
 
-        uint8_t* data = (uint8_t*)zmq_msg_data(&msg);
-        size_t len = zmq_msg_size(&msg);
+        logger_log(&s.logger, (uint8_t*)msg->getData(), msg->getSize(), qlog_counter[sock] == 0);
 
-        if (socks[i] == frame_sock) {
-          // make copy due to alignment issues, will be freed on out of scope
-          auto amsg = kj::heapArray<capnp::word>((len / sizeof(capnp::word)) + 1);
-          memcpy(amsg.begin(), data, len);
-
-          // track camera frames to sync to encoder
-          capnp::FlatArrayMessageReader cmsg(amsg);
-          cereal::Event::Reader event = cmsg.getRoot<cereal::Event>();
-          if (event.isFrame()) {
-            std::unique_lock<std::mutex> lk(s.lock);
-            s.last_frame_id = event.getFrame().getFrameId();
-            lk.unlock();
-            s.cv.notify_all();
-          }
-        }
-
-        if (ts_replace_sock.find(socks[i]) != ts_replace_sock.end()) {
-          // get new time
-          uint64_t current_time = nanos_since_boot();
-
-          // read out the current message
-          /*auto amsg = kj::heapArray<capnp::word>((len / sizeof(capnp::word)) + 1);
-          memcpy(amsg.begin(), data, len);
-          capnp::FlatArrayMessageReader cmsg(amsg);
-          cereal::Event::Reader revent = cmsg.getRoot<cereal::Event>();
-
-          // create a copy, ugh
-          capnp::MallocMessageBuilder msg;
-          msg.setRoot(revent);
-
-          // replace the timestamp with the current timestamp on the phone
-          cereal::Event::Builder event = msg.getRoot<cereal::Event>();
-
-          // test it's correct
-          auto twords = capnp::messageToFlatArray(msg);
-          auto tbytes = twords.asBytes();
-          assert(memcmp(data, tbytes.begin(), len) == 0);
-
-          // modify it
-          event.setLogMonoTime(current_time);
-
-          // put it back
-          auto words = capnp::messageToFlatArray(msg);
-          auto bytes = words.asBytes();
-          memcpy(data, bytes.begin(), len);*/
-
-          // binary patching HACK!
-          assert(memcmp(data+0xC, "\x02\x00\x01\x00", 4) == 0);
-          memcpy(data+0x10, &current_time, sizeof(current_time));
-        }
-
-        logger_log(&s.logger, data, len, qlog_counter[socks[i]] == 0);
-        zmq_msg_close(&msg);
-
-        if (qlog_counter[socks[i]] != -1) {
+        if (qlog_counter[sock] != -1) {
           //printf("%p: %d/%d\n", socks[i], qlog_counter[socks[i]], qlog_freqs[socks[i]]);
-          qlog_counter[socks[i]]++;
-          qlog_counter[socks[i]] %= qlog_freqs[socks[i]];
+          qlog_counter[sock]++;
+          qlog_counter[sock] %= qlog_freqs[sock];
         }
-
-        bytes_count += len;
+        bytes_count += msg->getSize();
         msg_count++;
+      }
+
+      if (last_msg) {
+        int fpkt_id = -1;
+        for (int cid=0;cid<=MAX_CAM_IDX;cid++) {
+          if (sock == s.rotate_state[cid].fpkt_sock) {fpkt_id=cid; break;}
+        }
+        if (fpkt_id>=0) {
+          // track camera frames to sync to encoder
+          // only process last frame
+          const uint8_t* data = (uint8_t*)last_msg->getData();
+          const size_t len = last_msg->getSize();
+          const size_t size = len / sizeof(capnp::word) + 1;
+          if (buf.size() < size) {
+            buf = kj::heapArray<capnp::word>(size);
+          }
+          memcpy(buf.begin(), data, len);
+
+          capnp::FlatArrayMessageReader cmsg(buf);
+          cereal::Event::Reader event = cmsg.getRoot<cereal::Event>();
+
+          if (fpkt_id == LOG_CAMERA_ID_FCAMERA) {
+            s.rotate_state[fpkt_id].setLogFrameId(event.getFrame().getFrameId());
+          } else if (fpkt_id == LOG_CAMERA_ID_DCAMERA) {
+            s.rotate_state[fpkt_id].setLogFrameId(event.getFrontFrame().getFrameId());
+          } else if (fpkt_id == LOG_CAMERA_ID_ECAMERA) {
+            s.rotate_state[fpkt_id].setLogFrameId(event.getWideFrame().getFrameId());
+          }
+          last_camera_seen_tms = millis_since_boot();
+        }
+        delete last_msg;
       }
     }
 
     double ts = seconds_since_boot();
-    if (ts - last_rotate_ts > SEGMENT_LENGTH) {
-      // rotate the log
+    double tms = millis_since_boot();
 
-      last_rotate_ts += SEGMENT_LENGTH;
+    bool new_segment = false;
 
-      std::lock_guard<std::mutex> guard(s.lock);
-      s.rotate_last_frame_id = s.last_frame_id;
-
-      if (is_logging) {
-        err = logger_next(&s.logger, LOG_ROOT, s.segment_path, sizeof(s.segment_path), &s.rotate_segment);
-        assert(err == 0);
-        LOGW("rotated to %s", s.segment_path);
+    if (s.logger.part > -1) {
+      new_segment = true;
+      if (tms - last_camera_seen_tms <= NO_CAMERA_PATIENCE && s.num_encoder > 0) {
+        for (int cid=0;cid<=MAX_CAM_IDX;cid++) {
+          // this *should* be redundant on tici since all camera frames are synced
+          new_segment &= (((s.rotate_state[cid].stream_frame_id >= s.rotate_state[cid].last_rotate_frame_id + segment_length * MAIN_FPS) &&
+                           (!s.rotate_state[cid].should_rotate) && (s.rotate_state[cid].initialized)) ||
+                          (!s.rotate_state[cid].enabled));
+#ifndef QCOM2
+          break; // only look at fcamera frame id if not QCOM2
+#endif
+        }
+      } else {
+        new_segment &= tms - last_rotate_tms > segment_length * 1000;
+        if (new_segment) { LOGW("no camera packet seen. auto rotated"); }
       }
+    } else if (s.logger.part == -1) {
+      // always starts first segment immediately
+      new_segment = true;
+    }
+
+    if (new_segment) {
+      pthread_mutex_lock(&s.rotate_lock);
+      last_rotate_tms = millis_since_boot();
+
+      err = logger_next(&s.logger, LOG_ROOT, s.segment_path, sizeof(s.segment_path), &s.rotate_segment);
+      assert(err == 0);
+      if (s.logger.part == 0) { LOGW("logging to %s", s.segment_path); }
+      LOGW("rotated to %s", s.segment_path);
+
+      // rotate the encoders
+      for (int cid=0;cid<=MAX_CAM_IDX;cid++) { s.rotate_state[cid].rotate(); }
+      pthread_mutex_unlock(&s.rotate_lock);
     }
 
     if ((msg_count%1000) == 0) {
@@ -751,20 +739,27 @@ int main(int argc, char** argv) {
   }
 
   LOGW("joining threads");
-  s.cv.notify_all();
+  for (int cid=0;cid<=MAX_CAM_IDX;cid++) { s.rotate_state[cid].cancelWait(); }
 
 #ifndef DISABLE_ENCODER
-  front_encoder_thread_handle.join();
+#ifdef QCOM2
+  wide_encoder_thread_handle.join();
+#endif
+  if (record_front) {
+    front_encoder_thread_handle.join();
+  }
   encoder_thread_handle.join();
   LOGW("encoder joined");
 #endif
 
-#if ENABLE_LIDAR
-  lidar_thread_handle.join();
-  LOGW("lidar joined");
-#endif
-
   logger_close(&s.logger);
+  LOGW("logger closed");
 
+  for (auto s : socks){
+    delete s;
+  }
+
+  delete poller;
+  delete s.ctx;
   return 0;
 }

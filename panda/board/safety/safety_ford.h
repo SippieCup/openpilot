@@ -7,19 +7,18 @@
 //      brake rising edge
 //      brake > 0mph
 
-int ford_brake_prev = 0;
-int ford_gas_prev = 0;
-bool ford_moving = false;
 
-static void ford_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
+static int ford_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
 
   int addr = GET_ADDR(to_push);
+  int bus = GET_BUS(to_push);
+  bool unsafe_allow_gas = unsafe_mode & UNSAFE_DISABLE_DISENGAGE_ON_GAS;
 
   if (addr == 0x217) {
     // wheel speeds are 14 bits every 16
-    ford_moving = false;
+    vehicle_moving = false;
     for (int i = 0; i < 8; i += 2) {
-      ford_moving |= GET_BYTE(to_push, i) | (GET_BYTE(to_push, (int)(i + 1)) & 0xFCU);
+      vehicle_moving |= GET_BYTE(to_push, i) | (GET_BYTE(to_push, (int)(i + 1)) & 0xFCU);
     }
   }
 
@@ -38,21 +37,26 @@ static void ford_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
   // exit controls on rising edge of brake press or on brake press when
   // speed > 0
   if (addr == 0x165) {
-    int brake = GET_BYTE(to_push, 0) & 0x20;
-    if (brake && (!(ford_brake_prev) || ford_moving)) {
+    brake_pressed = GET_BYTE(to_push, 0) & 0x20;
+    if (brake_pressed && (!brake_pressed_prev || vehicle_moving)) {
       controls_allowed = 0;
     }
-    ford_brake_prev = brake;
+    brake_pressed_prev = brake_pressed;
   }
 
   // exit controls on rising edge of gas press
   if (addr == 0x204) {
-    int gas = (GET_BYTE(to_push, 0) & 0x03) | GET_BYTE(to_push, 1);
-    if (gas && !(ford_gas_prev)) {
+    gas_pressed = ((GET_BYTE(to_push, 0) & 0x03) | GET_BYTE(to_push, 1)) != 0;
+    if (!unsafe_allow_gas && gas_pressed && !gas_pressed_prev) {
       controls_allowed = 0;
     }
-    ford_gas_prev = gas;
+    gas_pressed_prev = gas_pressed;
   }
+
+  if ((safety_mode_cnt > RELAY_TRNS_TIMEOUT) && (bus == 0) && (addr == 0x3CA)) {
+    relay_malfunction_set();
+  }
+  return 1;
 }
 
 // all commands: just steering
@@ -64,11 +68,20 @@ static void ford_rx_hook(CAN_FIFOMailBox_TypeDef *to_push) {
 static int ford_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
 
   int tx = 1;
+  int addr = GET_ADDR(to_send);
+
   // disallow actuator commands if gas or brake (with vehicle moving) are pressed
   // and the the latching controls_allowed flag is True
-  int pedal_pressed = ford_gas_prev || (ford_brake_prev && ford_moving);
+  int pedal_pressed = brake_pressed_prev && vehicle_moving;
+  bool unsafe_allow_gas = unsafe_mode & UNSAFE_DISABLE_DISENGAGE_ON_GAS;
+  if (!unsafe_allow_gas) {
+    pedal_pressed = pedal_pressed || gas_pressed_prev;
+  }
   bool current_controls_allowed = controls_allowed && !(pedal_pressed);
-  int addr = GET_ADDR(to_send);
+
+  if (relay_malfunction) {
+    tx = 0;
+  }
 
   // STEER: safety check
   if (addr == 0x3CA) {
@@ -92,11 +105,12 @@ static int ford_tx_hook(CAN_FIFOMailBox_TypeDef *to_send) {
   return tx;
 }
 
+// TODO: keep camera on bus 2 and make a fwd_hook
+
 const safety_hooks ford_hooks = {
   .init = nooutput_init,
   .rx = ford_rx_hook,
   .tx = ford_tx_hook,
   .tx_lin = nooutput_tx_lin_hook,
-  .ignition = default_ign_hook,
   .fwd = default_fwd_hook,
 };

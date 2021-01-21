@@ -1,24 +1,16 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <signal.h>
 #include <unistd.h>
 #include <sched.h>
 #include <sys/time.h>
 #include <sys/cdefs.h>
 #include <sys/types.h>
-#include <sys/time.h>
 #include <assert.h>
 #include <math.h>
 #include <ctime>
 #include <chrono>
-#include <map>
-#include <vector>
 #include <algorithm>
-
-#include <zmq.h>
-#include <capnp/serialize.h>
-#include "cereal/gen/cpp/log.capnp.h"
 
 #include "common/params.h"
 #include "common/swaglog.h"
@@ -46,7 +38,7 @@ inline int GET_FIELD_S(uint32_t w, uint32_t nb, uint32_t pos) {
 
 class EphemerisData {
   public:
-    EphemerisData(uint8_t svId, subframes_map subframes) {
+    EphemerisData(uint8_t svId, subframes_map &subframes) {
       this->svId = svId;
       int week_no = GET_FIELD_U(subframes[1][2+0], 10, 20);
       int t_gd = GET_FIELD_S(subframes[1][2+4], 8, 6);
@@ -201,10 +193,8 @@ inline bool UbloxMsgParser::valid_so_far() {
 
 kj::Array<capnp::word> UbloxMsgParser::gen_solution() {
   nav_pvt_msg *msg = (nav_pvt_msg *)&msg_parse_buf[UBLOX_HEADER_SIZE];
-  capnp::MallocMessageBuilder msg_builder;
-  cereal::Event::Builder event = msg_builder.initRoot<cereal::Event>();
-  event.setLogMonoTime(nanos_since_boot());
-  auto gpsLoc = event.initGpsLocationExternal();
+  MessageBuilder msg_builder;
+  auto gpsLoc = msg_builder.initEvent().initGpsLocationExternal();
   gpsLoc.setSource(cereal::GpsLocationData::SensorSource::UBLOX);
   gpsLoc.setFlags(msg->flags);
   gpsLoc.setLatitude(msg->lat * 1e-07);
@@ -223,8 +213,7 @@ kj::Array<capnp::word> UbloxMsgParser::gen_solution() {
   std::time_t utc_tt = timegm(&timeinfo);
   gpsLoc.setTimestamp(utc_tt * 1e+03 + msg->nano * 1e-06);
   float f[] = { msg->velN * 1e-03f, msg->velE * 1e-03f, msg->velD * 1e-03f };
-  kj::ArrayPtr<const float> ap(&f[0], sizeof(f) / sizeof(f[0]));
-  gpsLoc.setVNED(ap);
+  gpsLoc.setVNED(f);
   gpsLoc.setVerticalAccuracy(msg->vAcc * 1e-03);
   gpsLoc.setSpeedAccuracy(msg->sAcc * 1e-03);
   gpsLoc.setBearingAccuracy(msg->headAcc * 1e-05);
@@ -244,11 +233,8 @@ kj::Array<capnp::word> UbloxMsgParser::gen_raw() {
     return kj::Array<capnp::word>();
   }
   rxm_raw_msg_extra *measurements = (rxm_raw_msg_extra *)&msg_parse_buf[UBLOX_HEADER_SIZE + sizeof(rxm_raw_msg)];
-  capnp::MallocMessageBuilder msg_builder;
-  cereal::Event::Builder event = msg_builder.initRoot<cereal::Event>();
-  event.setLogMonoTime(nanos_since_boot());
-  auto gnss = event.initUbloxGnss();
-  auto mr = gnss.initMeasurementReport();
+  MessageBuilder msg_builder;
+  auto mr = msg_builder.initEvent().initUbloxGnss().initMeasurementReport();
   mr.setRcvTow(msg->rcvTow);
   mr.setGpsWeek(msg->week);
   mr.setLeapSeconds(msg->leapS);
@@ -303,11 +289,8 @@ kj::Array<capnp::word> UbloxMsgParser::gen_nav_data() {
       nav_frame_buffer[msg->gnssId][msg->svid][subframeId] = words;
     if(nav_frame_buffer[msg->gnssId][msg->svid].size() == 5) {
       EphemerisData ephem_data(msg->svid, nav_frame_buffer[msg->gnssId][msg->svid]);
-      capnp::MallocMessageBuilder msg_builder;
-      cereal::Event::Builder event = msg_builder.initRoot<cereal::Event>();
-      event.setLogMonoTime(nanos_since_boot());
-      auto gnss = event.initUbloxGnss();
-      auto eph = gnss.initEphemeris();
+      MessageBuilder msg_builder;
+      auto eph = msg_builder.initEvent().initUbloxGnss().initEphemeris();
       eph.setSvId(ephem_data.svId);
       eph.setToc(ephem_data.toc);
       eph.setGpsWeek(ephem_data.gpsWeek);
@@ -334,10 +317,8 @@ kj::Array<capnp::word> UbloxMsgParser::gen_nav_data() {
       eph.setTgd(ephem_data.Tgd);
       eph.setIonoCoeffsValid(ephem_data.ionoCoeffsValid);
       if(ephem_data.ionoCoeffsValid) {
-        kj::ArrayPtr<const double> apa(&ephem_data.ionoAlpha[0], sizeof(ephem_data.ionoAlpha) / sizeof(ephem_data.ionoAlpha[0]));
-        eph.setIonoAlpha(apa);
-        kj::ArrayPtr<const double> apb(&ephem_data.ionoBeta[0], sizeof(ephem_data.ionoBeta) / sizeof(ephem_data.ionoBeta[0]));
-        eph.setIonoBeta(apb);
+        eph.setIonoAlpha(ephem_data.ionoAlpha);
+        eph.setIonoBeta(ephem_data.ionoBeta);
       } else {
         eph.setIonoAlpha(kj::ArrayPtr<const double>());
         eph.setIonoBeta(kj::ArrayPtr<const double>());
@@ -346,6 +327,19 @@ kj::Array<capnp::word> UbloxMsgParser::gen_nav_data() {
     }
   }
   return kj::Array<capnp::word>();
+}
+
+kj::Array<capnp::word> UbloxMsgParser::gen_mon_hw() {
+  mon_hw_msg *msg = (mon_hw_msg *)&msg_parse_buf[UBLOX_HEADER_SIZE];
+
+  MessageBuilder msg_builder;
+  auto hwStatus = msg_builder.initEvent().initUbloxGnss().initHwStatus();
+  hwStatus.setNoisePerMS(msg->noisePerMS);
+  hwStatus.setAgcCnt(msg->agcCnt);
+  hwStatus.setAStatus((cereal::UbloxGnss::HwStatus::AntennaSupervisorState) msg->aStatus);
+  hwStatus.setAPower((cereal::UbloxGnss::HwStatus::AntennaPowerStatus) msg->aPower);
+  hwStatus.setJamInd(msg->jamInd);
+  return capnp::messageToFlatArray(msg_builder);
 }
 
 bool UbloxMsgParser::add_data(const uint8_t *incoming_data, uint32_t incoming_data_len, size_t &bytes_consumed) {

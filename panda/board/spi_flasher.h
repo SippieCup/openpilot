@@ -65,7 +65,14 @@ int usb_cb_control_msg(USB_Setup_TypeDef *setup, uint8_t *resp, bool hardwired) 
       // so it's blocked over wifi
       switch (setup->b.wValue.w) {
         case 0:
+          // TODO: put this back when it's no longer a "devkit"
+          //#ifdef ALLOW_DEBUG
+          #if 1
           if (hardwired) {
+          #else
+          // no more bootstub on UNO once OTP block is flashed
+          if (hardwired && ((hw_type != HW_TYPE_UNO) || (!is_provisioned()))) {
+          #endif
             puts("-> entering bootloader\n");
             enter_bootloader_mode = ENTER_BOOTLOADER_MAGIC;
             NVIC_SystemReset();
@@ -103,6 +110,7 @@ void usb_cb_ep3_out(void *usbdata, int len, bool hardwired) {
   UNUSED(len);
   UNUSED(hardwired);
 }
+void usb_cb_ep3_out_complete(void) {}
 
 int is_enumerated = 0;
 void usb_cb_enumeration_complete(void) {
@@ -151,7 +159,7 @@ int spi_cb_rx(uint8_t *data, int len, uint8_t *data_out) {
 #define CAN_BL_INPUT 0x1
 #define CAN_BL_OUTPUT 0x2
 
-void CAN1_TX_IRQHandler(void) {
+void CAN1_TX_IRQ_Handler(void) {
   // clear interrupt
   CAN->TSR |= CAN_TSR_RQCP0;
 }
@@ -178,12 +186,12 @@ void bl_can_send(uint8_t *odat) {
   CAN->sTxMailBox[0].TIR = (CAN_BL_OUTPUT << 21) | 1;
 }
 
-void CAN1_RX0_IRQHandler(void) {
+void CAN1_RX0_IRQ_Handler(void) {
   while (CAN->RF0R & CAN_RF0R_FMP0) {
     if ((CAN->sFIFOMailBox[0].RIR>>21) == CAN_BL_INPUT) {
       uint8_t dat[8];
       for (int i = 0; i < 8; i++) {
-        dat[0] = GET_BYTE(&CAN->sFIFOMailBox[0], i);
+        dat[i] = GET_BYTE(&CAN->sFIFOMailBox[0], i);
       }
       uint8_t odat[8];
       uint8_t type = dat[0] & 0xF0;
@@ -253,13 +261,19 @@ void CAN1_RX0_IRQHandler(void) {
   }
 }
 
-void CAN1_SCE_IRQHandler(void) {
+void CAN1_SCE_IRQ_Handler(void) {
   llcan_clear_send(CAN);
 }
 
 #endif
 
 void soft_flasher_start(void) {
+  #ifdef PEDAL
+    REGISTER_INTERRUPT(CAN1_TX_IRQn, CAN1_TX_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)
+    REGISTER_INTERRUPT(CAN1_RX0_IRQn, CAN1_RX0_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)
+    REGISTER_INTERRUPT(CAN1_SCE_IRQn, CAN1_SCE_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_1)
+  #endif
+
   puts("\n\n\n************************ FLASHER START ************************\n");
 
   enter_bootloader_mode = 0;
@@ -276,7 +290,7 @@ void soft_flasher_start(void) {
   // B8,B9: CAN 1
   set_gpio_alternate(GPIOB, 8, GPIO_AF9_CAN1);
   set_gpio_alternate(GPIOB, 9, GPIO_AF9_CAN1);
-  current_board->enable_can_transciever(1, true);
+  current_board->enable_can_transceiver(1, true);
 
   // init can
   llcan_set_speed(CAN1, 5000, false, false);
@@ -307,7 +321,7 @@ void soft_flasher_start(void) {
   // green LED on for flashing
   current_board->set_led(LED_GREEN, 1);
 
-  __enable_irq();
+  enable_interrupts();
 
   uint64_t cnt = 0;
 
